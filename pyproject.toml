@@ -1,0 +1,12 @@
+[project]
+name = "multipledirections"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "huggingface-hub>=0.35.3",
+    "torch>=2.8.0",
+    "transformer-lens>=2.16.1",
+]
