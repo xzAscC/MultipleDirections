@@ -211,3 +211,9 @@ __marimo__/
 
 # assets 
 assets/
+
+# ipynb
+*.ipynb
+
+# logs
+logs/
