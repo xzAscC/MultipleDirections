@@ -5,6 +5,7 @@ import transformer_lens
 import datasets
 import torch
 import os
+import gc
 from sklearn.decomposition import IncrementalPCA
 from loguru import logger
 from tqdm import tqdm
@@ -16,10 +17,10 @@ def concept_vector():
     parser.add_argument(
         "--model",
         type=str,
-        default="EleutherAI/pythia-70m",
+        default="google/gemma-2-2b-it",
         choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
     )
-    parser.add_argument("--layer", type=int, default=4)
+    parser.add_argument("--layer", type=int, default=16)
     parser.add_argument(
         "--dataset_path", type=str, default="assets/paired_contexts/en-fr.jsonl"
     )
@@ -66,41 +67,64 @@ class DifferenceInMeans:
         model_dimension = self.model.cfg.d_model
         positive_concept_vector = torch.zeros(model_dimension, device=self.device)
         negative_concept_vector = torch.zeros(model_dimension, device=self.device)
-        token_length = 0
+        positive_token_length = 0
+        negative_token_length = 0
         only_once = True
         for example in tqdm(self.dataset, desc="Calculating concept vectors"):
-            positive_context = example["contexts0"]
-            _, positive_cache = self.model.run_with_cache(
-                positive_context, stop_at_layer=self.layer + 1
-            )
-            positive_hidden_state = (
-                positive_cache[f"blocks.{self.layer}.hook_resid_post"]
-                .reshape(-1, model_dimension)
-                .mean(dim=0)
-            )
-            if only_once:
-                logger.info(f"hidden state shape: {positive_hidden_state.shape}")
-                only_once = False
-            positive_concept_vector += positive_hidden_state
-            negative_context = example["contexts1"]
-            _, negative_cache = self.model.run_with_cache(
-                negative_context, stop_at_layer=self.layer + 1
-            )
-            negative_hidden_state = (
-                negative_cache[f"blocks.{self.layer}.hook_resid_post"]
-                .reshape(-1, model_dimension)
-                .mean(dim=0)
-            )
-            negative_concept_vector += negative_hidden_state
-            token_length += positive_cache[
-                f"blocks.{self.layer}.hook_resid_post"
-            ].shape[-2]
-        logger.info(f"Token length: {token_length}")
-        positive_concept_vector /= token_length
-        negative_concept_vector /= token_length
+            torch.cuda.empty_cache()
+            gc.collect()
+            for context in example["contexts0"]:
+                _, positive_cache = self.model.run_with_cache(
+                    context, stop_at_layer=self.layer + 1
+                )
+                positive_hidden_state = (
+                    positive_cache[f"blocks.{self.layer}.hook_resid_post"]
+                    .reshape(-1, model_dimension)
+                    .mean(dim=0)
+                )
+                positive_concept_vector += positive_hidden_state
+            for context in example["contexts1"]:
+                _, negative_cache = self.model.run_with_cache(
+                    context, stop_at_layer=self.layer + 1
+                )
+                negative_hidden_state = (
+                    negative_cache[f"blocks.{self.layer}.hook_resid_post"]
+                    .reshape(-1, model_dimension)
+                    .mean(dim=0)
+                )
+                negative_concept_vector += negative_hidden_state
+            positive_token_length += len(example["contexts0"])
+            negative_token_length += len(example["contexts1"])
+        logger.info(f"Positive token length: {positive_token_length}")
+        logger.info(f"Negative token length: {negative_token_length}")
+        positive_concept_vector /= positive_token_length
+        negative_concept_vector /= negative_token_length
         concept_diff = positive_concept_vector - negative_concept_vector
         return torch.nn.functional.normalize(concept_diff, dim=0)
 
 
+def random_concept_vector():
+    """used to calculate the random concept vector of the model"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="google/gemma-2-2b-it", choices=["EleutherAI/pythia-70m", "google/gemma-2-2b-it"])
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
+    args = parser.parse_args()
+    model = transformer_lens.HookedTransformer.from_pretrained(
+        args.model, device=args.device, dtype=args.dtype
+    )
+    logger.info(f"Loading model: {args.model}")
+    model_dimension = model.cfg.d_model
+    logger.info(f"Model dimension: {model_dimension}")
+    random_concept_vector = torch.randn(model_dimension)
+    random_concept_vector = torch.nn.functional.normalize(random_concept_vector, dim=0)
+    random_concept_vector = random_concept_vector.to(args.device)
+    os.makedirs("weights/concept_vectors", exist_ok=True)
+    torch.save(random_concept_vector, f"weights/concept_vectors/random_concept_vector_{args.model.split('/')[-1]}.pt")
+    logger.info(f"Saved random concept vector to weights/concept_vectors/random_concept_vector_{args.model.split('/')[-1]}.pt")
+    logger.info(f"Random concept vector shape: {random_concept_vector.shape}")
+    logger.info(f"Random concept vector: {random_concept_vector.norm(dim=0).item()}")
+    return random_concept_vector
 if __name__ == "__main__":
-    concept_vector()
+    random_concept_vector()
+    # concept_vector()
