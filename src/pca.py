@@ -111,34 +111,103 @@ def steering(pretrained=True):
             return activations - projection
 
         logger.info(f"Added hook to layer {args.layer}")
+        _, cache_wo_hooks = model.run_with_cache(input_dataset[:1])
+        hs_needed_wo_hooks = cache_wo_hooks[f"ln_final.hook_normalized"].to(dtype)
         model.add_hook(f"blocks.{args.layer}.hook_resid_post", hook_fn)
         torch.cuda.empty_cache()
-        steering_probs = []
-        input_probs = []
-        progress_bar = tqdm(total=len(input_dataset), desc="Steering")
-        for _, (inputs, target_word, input_word) in enumerate(
-            zip(input_dataset, steering_target_words, input_target_words),
-        ):
-            target_id = model.to_tokens(target_word, prepend_bos=False).squeeze()
-            input_id = model.to_tokens(input_word, prepend_bos=False).squeeze()
-            input_len = len(input_id) if input_id.dim() > 0 else 1
-            _, cache = model.run_with_cache(inputs)
-            hs_needed = cache[f"ln_final.hook_normalized"].to(dtype)
-            logits = model.unembed(hs_needed[0, -1-input_len, :].to(dtype))
-            prob = torch.softmax(logits, dim=-1)
-            target_id = target_id[0] if target_id.dim() > 0 else target_id
-            input_id = input_id[0] if input_id.dim() > 0 else input_id
-            steering_probs.append(prob[target_id])
-            input_probs.append(prob[input_id])
-            progress_bar.update(1)
-        torch.save(
-            steering_probs,
-            f"weights/steering_probs_pca_Layer{args.layer}_{pca_num}_Methods{args.method}_Model{args.model.replace('/', '_')}_FileName{filename.replace('.jsonl', '')}.pt",
-        )
-        torch.save(
-            input_probs,
-            f"weights/input_probs_pca_Layer{args.layer}_{pca_num}_Methods{args.method}_Model{args.model.replace('/', '_')}_FileName{filename.replace('.jsonl', '')}.pt",
-        )
+        _, cache_with_hooks = model.run_with_cache(input_dataset[:1])
+        hs_needed = cache_with_hooks[f"ln_final.hook_normalized"].to(dtype)
+        diff = hs_needed - hs_needed_wo_hooks
+        # Compute Jacobian J = ∂Φ/∂x for each input
+        # J_i ∈ ℝ^{V×d} where V is vocab size and d is hidden dimension
+        jacobians = []
+        for i in range(len(input_dataset[:1])):
+            # Get the hidden state for this input
+            h = hs_needed_wo_hooks[i, -1, :].to(dtype)  # shape: (d,)
+            h.requires_grad_(True)
+            
+            # Compute logits through unembed
+            logits = model.unembed(h)  # shape: (V,)
+            
+            # Compute Jacobian: ∂logits/∂h
+            J = torch.zeros(logits.shape[0], h.shape[0], device=h.device, dtype=dtype)
+            for v in range(logits.shape[0]):
+                if h.grad is not None:
+                    h.grad.zero_()
+                logits[v].backward(retain_graph=True)
+                J[v] = h.grad.clone()
+            
+            jacobians.append(J)
+        
+        jacobians = torch.stack(jacobians)  # shape: (batch, V, d)
+        logger.info(f"Computed Jacobians with shape: {jacobians.shape}")
+        
+        # Compute cosine similarity between diff and J·r
+        # diff shape: (batch, d)
+        # jacobians shape: (batch, V, d)
+        # r is the principal component(s) we projected onto
+        r = concept_vectors[:pca_num, :].real.to(diff.device).to(diff.dtype).T  # shape: (d, pca_num)
+        
+        # Compute J·r for each sample
+        # Jr shape: (batch, V, pca_num)
+        Jr = torch.matmul(jacobians, r)  # (batch, V, d) @ (d, pca_num) -> (batch, V, pca_num)
+        
+        # For simplicity, take the first principal component
+        Jr_first = Jr[:, :, 0]  # shape: (batch, V)
+        
+        # diff is the change in hidden states: shape (batch, seq_len, d)
+        # We want the change at the last position
+        diff_last = diff[:, -1, :]  # shape: (batch, d)
+        
+        # Compute cosine similarity between diff_last and Jr_first
+        # We need to compare vectors in the same space
+        # diff_last is in ℝ^d, Jr_first is in ℝ^V
+        # Actually, Δℓ = Φ(x+αr) - Φ(x) should be in logit space (ℝ^V)
+        # So we need to compute the change in logits
+        
+        # Compute logits before and after intervention
+        logits_before = model.unembed(hs_needed_wo_hooks[:, -1, :])  # (batch, V)
+        logits_after = model.unembed(hs_needed[:, -1, :])  # (batch, V)
+        delta_logits = logits_after - logits_before  # (batch, V)
+        
+        # Now compute cosine similarity between delta_logits and Jr_first
+        # Both are shape (batch, V)
+        cos_sims = []
+        for i in range(len(input_dataset[:1])):
+            delta_l = diff[i]  # (V,)
+            jr = Jr_first[i]  # (V,)
+            
+            # Cosine similarity
+            cos_sim = torch.nn.functional.cosine_similarity(
+                delta_l.unsqueeze(0), jr.unsqueeze(0), dim=1
+            )
+            cos_sims.append(cos_sim.item())
+        
+        logger.info(f"Cosine similarities between Δℓ and J·r: {cos_sims}")
+        logger.info(f"Mean cosine similarity: {sum(cos_sims) / len(cos_sims):.4f}")
+        # for _, (inputs, target_word, input_word) in enumerate(
+        #     zip(input_dataset, steering_target_words, input_target_words),
+        # ):
+        #     target_id = model.to_tokens(target_word, prepend_bos=False).squeeze()
+        #     input_id = model.to_tokens(input_word, prepend_bos=False).squeeze()
+        #     input_len = len(input_id) if input_id.dim() > 0 else 1
+        #     _, cache = model.run_with_cache(inputs)
+        #     hs_needed = cache[f"ln_final.hook_normalized"].to(dtype)
+        #     logits = model.unembed(hs_needed[0, -1-input_len, :].to(dtype))
+        #     prob = torch.softmax(logits, dim=-1)
+        #     target_id = target_id[0] if target_id.dim() > 0 else target_id
+        #     input_id = input_id[0] if input_id.dim() > 0 else input_id
+        #     steering_probs.append(prob[target_id])
+        #     input_probs.append(prob[input_id])
+        #     progress_bar.update(1)
+        # torch.save(
+        #     steering_probs,
+        #     f"weights/steering_probs_pca_Layer{args.layer}_{pca_num}_Methods{args.method}_Model{args.model.replace('/', '_')}_FileName{filename.replace('.jsonl', '')}.pt",
+        # )
+        # torch.save(
+        #     input_probs,
+        #     f"weights/input_probs_pca_Layer{args.layer}_{pca_num}_Methods{args.method}_Model{args.model.replace('/', '_')}_FileName{filename.replace('.jsonl', '')}.pt",
+        # )
 
         # model.reset_hooks()
         # torch.cuda.empty_cache()
