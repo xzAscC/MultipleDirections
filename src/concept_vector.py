@@ -17,12 +17,12 @@ def concept_vector():
     parser.add_argument(
         "--model",
         type=str,
-        default="google/gemma-2-2b-it",
+        default="EleutherAI/pythia-70m ",
         choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
     )
     parser.add_argument("--layer", type=int, default=16)
     parser.add_argument(
-        "--dataset_path", type=str, default="assets/paired_contexts/en-fr.jsonl"
+        "--dataset_path", type=str, default="assets/paired_contexts/en-fr.jsonl", choices=["assets/paired_contexts/en-fr.jsonl", ]
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -125,6 +125,31 @@ def random_concept_vector():
     logger.info(f"Random concept vector shape: {random_concept_vector.shape}")
     logger.info(f"Random concept vector: {random_concept_vector.norm(dim=0).item()}")
     return random_concept_vector
+
+def harmful_concept_vector():
+    """used to calculate the harmful concept vector of the model"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="google/gemma-2-2b-it", choices=["EleutherAI/pythia-70m", "google/gemma-2-2b-it"])
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
+    args = parser.parse_args()
+    model = transformer_lens.HookedTransformer.from_pretrained(
+        args.model, device=args.device, dtype=args.dtype)
+    logger.info(f"Loading model: {args.model}")
+    model_dimension = model.cfg.d_model
+    logger.info(f"Model dimension: {model_dimension}")
+    harmful_concept_vector = torch.randn(model_dimension)
+    harmful_concept_vector = torch.nn.functional.normalize(harmful_concept_vector, dim=0)
+    harmful_concept_vector = harmful_concept_vector.to(args.device)
+    os.makedirs("weights/concept_vectors", exist_ok=True)
+    torch.save(harmful_concept_vector, f"weights/concept_vectors/harmful_concept_vector_{args.model.split('/')[-1]}.pt")
+    logger.info(f"Saved harmful concept vector to weights/concept_vectors/harmful_concept_vector_{args.model.split('/')[-1]}.pt")
+    logger.info(f"Harmful concept vector shape: {harmful_concept_vector.shape}")
+    logger.info(f"Harmful concept vector: {harmful_concept_vector.norm(dim=0).item()}")
+    return harmful_concept_vector
+
 if __name__ == "__main__":
-    random_concept_vector()
+    # random_concept_vector()
     # concept_vector()
+    
+    harmful_concept_vector()

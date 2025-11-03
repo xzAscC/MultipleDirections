@@ -11,17 +11,19 @@ from torch.autograd import grad
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.backends.cuda import sdp_kernel
 
-
-def linearity():
-    """used to measure the linearity of the model"""
+def config():
+    """used to configure the arguments
+    Returns:
+        args: the arguments
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
         type=str,
-        default="google/gemma-2-2b-it",
+        default="EleutherAI/pythia-70m",
         choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
     )
-    parser.add_argument("--layer", type=int, default=12)
+    parser.add_argument("--layer", type=int, default=4)
     parser.add_argument(
         "--dataset_path", type=str, default="assets/paired_contexts/en-fr.jsonl"
     )
@@ -30,7 +32,7 @@ def linearity():
     parser.add_argument(
         "--concept_vector_path",
         type=str,
-        default="weights/concept_vectors/random_concept_vector_gemma-2-2b-it.pt",
+        default="weights/concept_vectors/random_concept_vector_pythia-70m.pt",
         choices=[
             "weights/concept_vectors/pythia-70m_Layer4_difference-in-means_en-fr.pt",
             "weights/concept_vectors/random_concept_vector_pythia-70m.pt",
@@ -44,10 +46,18 @@ def linearity():
     parser.add_argument("--random_concept_vector", action="store_true")
     parser.add_argument("--alpha_factor", type=int, default=1000)
     args = parser.parse_args()
+    return args
+
+def linearity():
+    """used to measure the linearity of the model"""
+    args = config()
+    
+    # add logger
     logger.add("logs/linearity.log")
     logger.info("Starting linearity measurement...")
     logger.info(f"Loading model: {args.model}")
-
+    
+    # load model
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map=args.device,
@@ -58,11 +68,8 @@ def linearity():
         args.model,
         use_fast=True,
     )
-    # model = transformer_lens.HookedTransformer.from_pretrained(
-    #     args.model,
-    #     device=args.device,
-    #     dtype=getattr(torch, args.dtype),
-    # )
+
+    # load dataset
     logger.info(f"Loading dataset: {args.dataset_path}")
     dataset = datasets.load_dataset("json", data_files=args.dataset_path)["train"]
     logger.info(f"Loaded {len(dataset)} examples")
@@ -70,16 +77,19 @@ def linearity():
     concept_vector = torch.load(args.concept_vector_path)
     logger.info(f"Concept vector shape: {concept_vector.shape}")
 
-    def hook_fn(activations, hook):
-        return activations - args.concept_vector_alpha * concept_vector
 
     # measure the linearity of the model
     only_once = True
-    predicted_diff_ratios = []
-    for example in tqdm(dataset, desc="Measuring linearity"):
-        # https://github.com/sugolov/coupling/blob/main/coupling/main.py#L35
+    per_alpha_token_increases = [[] for _ in range(args.alpha_factor)]
+    idy = 0
+    progress_bar = tqdm(total=10, desc="Measuring linearity")
+    for example in dataset:
         contexts = example["contexts0"]
         for context in contexts:
+            if idy > 10:
+                break
+            idy += 1
+            progress_bar.update(1)
             tokens = tokenizer(context, return_tensors="pt", truncation=True).to(
                 args.device
             )
@@ -129,31 +139,27 @@ def linearity():
             cap_handle.remove()
             act_base = captured["act"]  # 形状: [1, seq_len, d_model]（或等价）
 
-            # 2) 定义 f(act): 用 hook 将该层输出替换为 act，返回目标 token 的 logits 向量
-            index = 10  # 与你之前 jacobian 的 index 保持一致
-            def f(act):
-                def _replace_hook(module, inputs, output):
-                    return (act,) + output[1:] if isinstance(output, tuple) else act
-                h = target_layer_module.register_forward_hook(_replace_hook)
-                with sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
-                    out = model(input_ids, output_hidden_states=False).logits[0, index, :]  # 形状: [vocab]
-                h.remove()
-                return out
+            # 2) 对每个 token 位置计算一次 JVP，得到 base_jvp: [seq_len, vocab]
+            seq_len = int(tokens.attention_mask[0].sum().item()) if "attention_mask" in tokens else act_base.shape[1]
+            base_jvps = []
+            for idx in range(seq_len):
+                def f(act, _idx=idx):
+                    def _replace_hook(module, inputs, output):
+                        return (act,) + output[1:] if isinstance(output, tuple) else act
+                    h = target_layer_module.register_forward_hook(_replace_hook)
+                    with sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                        out = model(input_ids, output_hidden_states=False, use_cache=False).logits[0, _idx, :]
+                    h.remove()
+                    return out
 
-            # 3) 准备方向向量 delta_act（只在 index 位置注入 concept_vector）
-            delta_act = torch.zeros_like(act_base)
-            delta_act[0, index, :] = concept_vector.to(device=act_base.device, dtype=act_base.dtype)
+                delta_act = torch.zeros_like(act_base)
+                delta_act[0, idx, :] = concept_vector.to(device=act_base.device, dtype=act_base.dtype)
+                _, jvp_i = torch.autograd.functional.jvp(f, (act_base,), (delta_act,), create_graph=False)
+                base_jvps.append(jvp_i.detach())
 
-            # 4) 一次性 JVP：得到 base_jvp = J @ concept_vector
-            _, base_jvp = torch.autograd.functional.jvp(f, (act_base,), (delta_act,), create_graph=False)
+            base_jvp = torch.stack(base_jvps, dim=0)  # [seq_len, vocab]
 
-            # 5) 在你多 alpha 循环里，用 predicted_output_diff = concept_vector_alpha * base_jvp
-            #    注意：这里不需要再算 jacobian_without_hook 了
-
-            for i in tqdm(
-                range(args.alpha_factor),
-                desc="Running model with hook for different alphas",
-            ):
+            for i in range(args.alpha_factor):
                 concept_vector_alpha = args.concept_vector_alpha * (i + 1)
 
                 # Add hook to modify activations at the target layer
@@ -175,89 +181,52 @@ def linearity():
                 hook_handle = target_layer_module.register_forward_hook(_forward_hook)
                 with torch.enable_grad(), sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
                     outputs_with_hook = model(input_ids, output_hidden_states=True)
-                hidden_state_diff = outputs_with_hook.logits - logits_without_hook
+                hidden_state_diff = outputs_with_hook.logits[0, :seq_len, :] - logits_without_hook[0, :seq_len, :]
                 if only_once:
                     logger.info(f"Hidden state diff shape: {hidden_state_diff.shape}")
                     only_once = False
-                predicted_output_diff = base_jvp
-                predicted_diff_ratios.append(
-                    hidden_state_diff[0, 10, :].to(torch.bfloat16).norm(dim=0).item()
-                    / predicted_output_diff.to(torch.bfloat16).norm(dim=0).item()
-                )
+                predicted_output_diff = concept_vector_alpha * base_jvp  # [seq_len, vocab]
+                ratios = (hidden_state_diff.to(torch.bfloat16).norm(dim=-1) / predicted_output_diff.to(torch.bfloat16).norm(dim=-1)).tolist()
+                per_alpha_token_increases[i].extend(ratios)
                 hook_handle.remove()
 
-            # Create x-axis values (alpha values)
-            x = [
-                i * args.concept_vector_alpha for i in range(len(predicted_diff_ratios))
-            ]
-            y = predicted_diff_ratios
+    progress_bar.close()                    
+    # After processing all contexts/examples: per-alpha mean/std over per-token increases
+    import numpy as np
+    x = [i * args.concept_vector_alpha for i in range(len(per_alpha_token_increases))]
+    means = [
+        float(np.mean(per_alpha_token_increases[i])) if len(per_alpha_token_increases[i]) > 0 else 0.0
+        for i in range(len(per_alpha_token_increases))
+    ]
+    stds = [
+        float(np.std(per_alpha_token_increases[i])) if len(per_alpha_token_increases[i]) > 0 else 0.0
+        for i in range(len(per_alpha_token_increases))
+    ]
+    logger.info(f"counts per alpha: {[len(v) for v in per_alpha_token_increases][:5]} ...")
+    plt.errorbar(x, means, yerr=stds, fmt='o', capsize=3, ecolor='gray', alpha=0.9, label='mean ± std')
+    plt.plot(x, means, 'r--', linewidth=1)
+    plt.xlabel("Alpha", fontsize=12)
+    plt.ylabel("||Δlogits|| (per token)", fontsize=12)
+    plt.title("Per-token increase vs Alpha (mean ± std)", fontsize=14)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
 
-            # Create scatter plot
-            plt.scatter(x, y, alpha=0.6, s=50)
+    os.makedirs("plots/linearity", exist_ok=True)
+    plt.savefig(
+        f"plots/linearity/predicted_diff_ratios_{args.model.split('/')[-1]}_Layer{args.layer}_concept_vector_{args.concept_vector_path.split('/')[-1].split('.')[0]}_ConceptVectorAlpha{args.concept_vector_alpha}_AlphaFactor{args.alpha_factor}.pdf"
+    )
+    plt.close()
+    os.makedirs("weights/linearity", exist_ok=True)
+    torch.save(
+        {
+            "per_token_increases": per_alpha_token_increases,
+            "mean": means,
+            "std": stds,
+        },
+        f"weights/linearity/predicted_diff_ratios_{args.model.split('/')[-1]}_Layer{args.layer}_concept_vector_{args.concept_vector_path.split('/')[-1].split('.')[0]}_ConceptVectorAlpha{args.concept_vector_alpha}_AlphaFactor{args.alpha_factor}.pt",
+    )
 
-            # Fit a linear regression line
-            x_tensor = torch.tensor(x, dtype=torch.float32)
-            y_tensor = torch.tensor(y, dtype=torch.float32)
-            # Use numpy for polynomial fitting since torch doesn't have polyfit
-            import numpy as np
-
-            coeffs = np.polyfit(x_tensor.cpu().numpy(), y_tensor.cpu().numpy(), 1)
-            poly_fn = np.poly1d(coeffs)
-
-            # Plot the fitted line
-            plt.plot(
-                x,
-                [poly_fn(xi) for xi in x],
-                "r--",
-                linewidth=2,
-                label=f"Fit: y={coeffs[0]:.3f}x+{coeffs[1]:.3f}",
-            )
-
-            # Add labels and title
-            plt.xlabel("Alpha", fontsize=12)
-            plt.ylabel("Predicted Diff Ratio", fontsize=12)
-            plt.title("Predicted Diff Ratio vs Alpha", fontsize=14)
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-
-            os.makedirs("plots/linearity", exist_ok=True)
-            plt.savefig(
-                f"plots/linearity/predicted_diff_ratios_{args.model.split('/')[-1]}_Layer{args.layer}_concept_vector_{args.concept_vector_path.split('/')[-1].split('.')[0]}_ConceptVectorAlpha{args.concept_vector_alpha}_AlphaFactor{args.alpha_factor}.pdf"
-            )
-            plt.close()
-            os.makedirs("weights/linearity", exist_ok=True)
-            torch.save(
-                predicted_diff_ratios,
-                f"weights/linearity/predicted_diff_ratios_{args.model.split('/')[-1]}_Layer{args.layer}_concept_vector_{args.concept_vector_path.split('/')[-1].split('.')[0]}_ConceptVectorAlpha{args.concept_vector_alpha}_AlphaFactor{args.alpha_factor}.pt",
-            )
-            exit()
     logger.info(f"Finished measuring linearity")
-
-
-def jacobian(output, input, index, chunks, index_in=None, device="cuda"):
-    """
-    Reference: https://github.com/sugolov/coupling/blob/main/coupling/jacobian.py
-    Computes the Jacobian of `d{output}/d{input}` from transformer hooks
-    by vectorizing over gradients.
-
-    output:     Jacobian wrt this output
-    input:      Jacobian wrt this input
-    index:      index of output token
-    chunks:     number of chunks used to vectorize Jacobian computation
-    index_in:   (optional) changes input token of Jacobian if not `index`
-    """
-
-    output = output[0, index, :]
-    I_N = torch.eye(output.numel()).to(device)
-
-    index_in = index_in if index_in is not None else index
-
-    def get_vjp(v):
-        return grad(output, input, v, retain_graph=True)[0][0, index_in, :]
-
-    jacobian = chunk_vmap(get_vjp, chunks=chunks)(I_N)
-
-    return jacobian
 
 
 if __name__ == "__main__":
