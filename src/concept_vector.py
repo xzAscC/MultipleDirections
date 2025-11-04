@@ -224,7 +224,6 @@ def random_concept_vector():
 
 
 if __name__ == "__main__":
-    # random_concept_vector()
-    # concept_vector()
+    random_concept_vector()
 
-    concept_vector()
+    # concept_vector()
