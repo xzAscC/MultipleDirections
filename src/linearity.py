@@ -366,7 +366,7 @@ def linearity_token():
     progress_bar = tqdm(total=args.max_dataset_size, desc="Measuring linearity")
     each_token_lss = []
     idy = 0
-    diff_list = []
+    # diff_list = []
 
     for example in dataset:
         context = example[dataset_key]
@@ -453,41 +453,45 @@ def linearity_token():
             args.alpha_factor,
         )
         each_token_lss.extend(lss)
-        if max(lss) > 2:
-            indices = [i for i, val in enumerate(lss) if val > 2]
+        if min(lss) < 1.05:
+            indices = [i for i, val in enumerate(lss) if val < 1.05]
             one_diff_list = []
-            for i in range(args.alpha_factor):
-                concept_vector_alpha = args.concept_vector_alpha * (i + 1)
+            
+            concept_vector_alpha = args.concept_vector_alpha * 1000
 
-                # Add hook to modify activations at the target layer
-                def _forward_hook(module, inputs, output):
-                    # Ensure concept vector matches device/dtype
-                    if isinstance(output, tuple):
-                        hidden = output[0]
-                        vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
-                        hidden = hidden + concept_vector_alpha * vec
-                        return (hidden,) + output[1:]
-                    else:
-                        vec = concept_vector.to(device=output.device, dtype=output.dtype)
-                        return output - concept_vector_alpha * vec
+            # Add hook to modify activations at the target layer
+            def _forward_hook(module, inputs, output):
+                # Ensure concept vector matches device/dtype
+                if isinstance(output, tuple):
+                    hidden = output[0]
+                    vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
+                    hidden = hidden + concept_vector_alpha * vec
+                    return (hidden,) + output[1:]
+                else:
+                    vec = concept_vector.to(device=output.device, dtype=output.dtype)
+                    return output - concept_vector_alpha * vec
 
-                hook_handle = target_layer_module.register_forward_hook(_forward_hook)
-                with (
-                    torch.enable_grad(),
-                    sdp_kernel(
-                        enable_flash=False, enable_mem_efficient=False, enable_math=True
-                    ),
-                ):
-                    outputs_with_hook = model(input_ids, output_hidden_states=True)
-                    diff = outputs_with_hook.logits[0, indices[0], :] - logits_without_hook[0, indices[0], :]
-                    diff_norm = torch.norm(diff, p=2)
-                    one_diff_list.append(diff_norm.item())
-                hook_handle.remove()
-            diff_list.append(one_diff_list)
+            hook_handle = target_layer_module.register_forward_hook(_forward_hook)
+            with (
+                torch.enable_grad(),
+                sdp_kernel(
+                    enable_flash=False, enable_mem_efficient=False, enable_math=True
+                ),
+            ):
+                outputs_with_hook = model(input_ids, output_hidden_states=True)
+                diff = outputs_with_hook.logits[0, indices[0], :] - logits_without_hook[0, indices[0], :]
+                print(diff.shape)
+                top_indices = torch.topk(diff, k=50, dim=-1, largest=True).indices
+                for idx in top_indices:
+                    print(tokenizer.decode(idx))
+                exit()
+                # one_diff_list.append(diff_norm.item())
+            hook_handle.remove()
+            # diff_list.append(one_diff_list)
         progress_bar.update(1)
     progress_bar.close()
     # After processing all contexts/examples: per-alpha mean/std over per-token increases
-    torch.save(diff_list, f"weights/linearity/lss/linearity_diff_larger_than_2_pythia-70m_Layer2.pt")
+    # torch.save(diff_list, f"weights/linearity/lss/linearity_diff_larger_than_2_pythia-70m_Layer2.pt")
 
 
 def linearity_each_layer():
@@ -532,7 +536,7 @@ def linearity_each_layer():
     
     # We steer at layer 2
     steer_layer = 2
-    concept_vector = concept_vectors[steer_layer + 2, :]
+    concept_vector = concept_vectors[steer_layer + 3, :]
     
     # We will measure LSS at all layers from steer_layer to the final logits
     layers_to_measure = list(range(steer_layer + 1, num_layers))
@@ -648,4 +652,4 @@ def linearity_each_layer():
         logger.info(f"{layer_name} - Mean LSS: {lss_tensor.mean().item():.4f}, Std: {lss_tensor.std().item():.4f}, Max: {lss_tensor.max().item():.4f}")
     
 if __name__ == "__main__":
-    linearity_each_layer()
+    linearity_token()
