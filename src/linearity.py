@@ -490,6 +490,162 @@ def linearity_token():
     torch.save(diff_list, f"weights/linearity/lss/linearity_diff_larger_than_2_pythia-70m_Layer2.pt")
 
 
+def linearity_each_layer():
+    args = config()
 
+    # add logger
+    logger.add("logs/linearity.log")
+    logger.info("Starting linearity measurement...")
+    logger.info(f"Loading model: {args.model}")
+
+    # load model
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        device_map=args.device,
+        trust_remote_code=True,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        use_fast=True,
+    )
+
+    # load dataset
+    logger.info(f"Loading dataset: {args.dataset_path}")
+    dataset = datasets.load_dataset("json", data_files=args.dataset_path)["train"]
+    logger.info(f"Loaded {len(dataset)} examples")
+    logger.info(f"Loading concept vector: {args.concept_vector_path}")
+    concept_vectors = torch.load(args.concept_vector_path)
+    logger.info(f"Concept vector shape: {concept_vectors.shape}")
+
+    # measure the linearity of the model
+    if args.concept_category == "safety":
+        dataset_key = "instruction"
+    elif args.concept_category == "language_translation":
+        # TODO
+        dataset_key = "context"
+    else:
+        raise ValueError(f"Invalid concept category: {args.concept_category}")
+    
+    num_layers = model.config.num_hidden_layers
+    logger.info(f"Model has {num_layers} layers")
+    
+    # We steer at layer 2
+    steer_layer = 2
+    concept_vector = concept_vectors[steer_layer + 2, :]
+    
+    # We will measure LSS at all layers from steer_layer to the final logits
+    layers_to_measure = list(range(steer_layer + 1, num_layers))
+    logger.info(f"Steering at layer {steer_layer}, measuring LSS at layers: {layers_to_measure}")
+    
+    # Store LSS results for each layer: layer_idx -> list of token LSS values
+    layer_lss_results = {layer_idx: [] for layer_idx in layers_to_measure}
+    layer_lss_results["logits"] = []  # Also measure at final logits
+    
+    progress_bar = tqdm(total=args.max_dataset_size, desc="Measuring linearity across layers")
+    idy = 0
+
+    for example in dataset:
+        context = example[dataset_key]
+        if idy >= args.max_dataset_size:
+            break
+        idy += 1
+        
+        tokens = tokenizer(context, return_tensors="pt", truncation=True).to(args.device)
+        input_ids = tokens.input_ids
+
+        layers_container = _get_layers_container(model)
+        steer_layer_module = layers_container[steer_layer]
+
+        # First, get baseline outputs without steering
+        with (
+            torch.enable_grad(),
+            sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True),
+        ):
+            base_outputs = model(input_ids, output_hidden_states=True)
+            logits_without_hook = base_outputs.logits
+            hidden_states_without_hook = base_outputs.hidden_states
+
+        seq_len = (
+            int(tokens.attention_mask[0].sum().item())
+            if "attention_mask" in tokens
+            else input_ids.shape[1]
+        )
+
+        # For each layer we want to measure, compute LSS
+        for measure_layer_idx in layers_to_measure + ["logits"]:
+            # Initialize storage for middle states
+            lss_middle_states = torch.zeros(
+                2,
+                seq_len,
+                model.config.vocab_size if measure_layer_idx == "logits" else model.config.hidden_size,
+                device=torch.device(args.device),
+                dtype=getattr(torch, args.dtype),
+            )
+            
+            # Compute LSS by steering at steer_layer and measuring at measure_layer_idx
+            for i in range(args.alpha_factor):
+                concept_vector_alpha = args.concept_vector_alpha * (i + 1)
+
+                # Hook to steer at steer_layer
+                def _forward_hook(module, inputs, output):
+                    if isinstance(output, tuple):
+                        hidden = output[0]
+                        vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
+                        hidden = hidden + concept_vector_alpha * vec
+                        return (hidden,) + output[1:]
+                    else:
+                        vec = concept_vector.to(device=output.device, dtype=output.dtype)
+                        return output + concept_vector_alpha * vec
+
+                hook_handle = steer_layer_module.register_forward_hook(_forward_hook)
+                with (
+                    torch.enable_grad(),
+                    sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True),
+                ):
+                    outputs_with_hook = model(input_ids, output_hidden_states=True)
+
+                # Extract the representation at the layer we're measuring
+                if measure_layer_idx == "logits":
+                    steered_repr = outputs_with_hook.logits[0, :seq_len, :]
+                    baseline_repr = logits_without_hook[0, :seq_len, :]
+                else:
+                    # hidden_states is a tuple: (embedding, layer0, layer1, ..., layerN)
+                    # So layer i is at index i+1
+                    steered_repr = outputs_with_hook.hidden_states[measure_layer_idx + 1][0, :seq_len, :]
+                    baseline_repr = hidden_states_without_hook[measure_layer_idx + 1][0, :seq_len, :]
+                
+                lss_middle_states = compute_line_shape_score_middle_states(
+                    steered_repr,
+                    baseline_repr,
+                    lss_middle_states,
+                    i,
+                )
+                hook_handle.remove()
+
+            # Compute final LSS for this layer
+            lss = compute_line_shape_score(
+                lss_middle_states[1, :, :],
+                baseline_repr,
+                args.alpha_factor,
+            )
+            
+            layer_lss_results[measure_layer_idx].extend(lss)
+        
+        progress_bar.update(1)
+    
+    progress_bar.close()
+    
+    # Save results for each layer
+    for layer_idx in layers_to_measure + ["logits"]:
+        layer_name = f"Layer{layer_idx}" if layer_idx != "logits" else "Logits"
+        save_path = f"weights/linearity/lss/linearity_steer_layer{steer_layer}_measure_{layer_name}_pythia-70m_random.pt"
+        torch.save(layer_lss_results[layer_idx], save_path)
+        logger.info(f"Saved LSS results for {layer_name} to {save_path}")
+        
+        # Log statistics
+        lss_tensor = torch.tensor(layer_lss_results[layer_idx])
+        logger.info(f"{layer_name} - Mean LSS: {lss_tensor.mean().item():.4f}, Std: {lss_tensor.std().item():.4f}, Max: {lss_tensor.max().item():.4f}")
+    
 if __name__ == "__main__":
-    linearity_token()
+    linearity_each_layer()
