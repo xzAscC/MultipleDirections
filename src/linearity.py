@@ -22,7 +22,7 @@ def config():
         default="EleutherAI/pythia-70m",
         choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
     )
-    parser.add_argument("--layer", type=int, default=4)
+    parser.add_argument("--layer", type=int, default=1)
     parser.add_argument(
         "--dataset_path",
         type=str,
@@ -48,10 +48,10 @@ def config():
             "weights/concept_vectors/random_concept_vector_gemma-2-2b-it.pt",
         ],
     )
-    parser.add_argument("--concept_vector_alpha", type=float, default=1e-1)
+    parser.add_argument("--concept_vector_alpha", type=float, default=1e-2)
     parser.add_argument("--random_concept_vector", action="store_true")
-    parser.add_argument("--alpha_factor", type=int, default=100)
-    parser.add_argument("--max_dataset_size", type=int, default=300)
+    parser.add_argument("--alpha_factor", type=int, default=1000)
+    parser.add_argument("--max_dataset_size", type=int, default=50)
     parser.add_argument(
         "--concept_category",
         type=str,
@@ -113,12 +113,10 @@ def linearity():
     dataset = datasets.load_dataset("json", data_files=args.dataset_path)["train"]
     logger.info(f"Loaded {len(dataset)} examples")
     logger.info(f"Loading concept vector: {args.concept_vector_path}")
-    concept_vector = torch.load(args.concept_vector_path)[args.layer, :]
-    logger.info(f"Concept vector shape: {concept_vector.shape}")
+    concept_vectors = torch.load(args.concept_vector_path)
+    logger.info(f"Concept vector shape: {concept_vectors.shape}")
 
     # measure the linearity of the model
-    idy = 0
-
     if args.concept_category == "safety":
         dataset_key = "instruction"
     elif args.concept_category == "language_translation":
@@ -126,102 +124,110 @@ def linearity():
         dataset_key = "context"
     else:
         raise ValueError(f"Invalid concept category: {args.concept_category}")
+    layers = model.config.num_hidden_layers
+    logger.info(f"Measuring linearity for {layers} layers")
+    for layer_idx in range(layers):
+        logger.info(f"Measuring linearity for layer {layer_idx}")
+        idy = 0
+        if layer_idx < 3:
+            concept_vector = concept_vectors[layer_idx + 3, :]
+        else:
+            concept_vector = concept_vectors[layer_idx - 3, :]
+        progress_bar = tqdm(total=args.max_dataset_size, desc="Measuring linearity")
+        each_token_lss = []
+        for example in dataset:
+            context = example[dataset_key]
+            if idy > args.max_dataset_size:
+                break
+            idy += 1
+            tokens = tokenizer(context, return_tensors="pt", truncation=True).to(
+                args.device
+            )
+            input_ids = tokens.input_ids
 
-    progress_bar = tqdm(total=args.max_dataset_size, desc="Measuring linearity")
-    each_token_lss = []
-    for example in dataset:
-        context = example[dataset_key]
-        if idy > args.max_dataset_size:
-            break
-        idy += 1
-        tokens = tokenizer(context, return_tensors="pt", truncation=True).to(
-            args.device
-        )
-        input_ids = tokens.input_ids
+            layers_container = _get_layers_container(model)
+            target_layer_module = layers_container[layer_idx]
 
-        layers_container = _get_layers_container(model)
-        target_layer_module = layers_container[args.layer - 1]
+            # 1) Capture the actual activation act_base at the target layer (participates in computation graph)
+            captured = {"act": None}
 
-        # 1) Capture the actual activation act_base at the target layer (participates in computation graph)
-        captured = {"act": None}
+            def _capture_hook(module, inputs, output):
+                out = output[0] if isinstance(output, tuple) else output
+                captured["act"] = out
+                return output
 
-        def _capture_hook(module, inputs, output):
-            out = output[0] if isinstance(output, tuple) else output
-            captured["act"] = out
-            return output
-
-        cap_handle = target_layer_module.register_forward_hook(_capture_hook)
-        with (
-            torch.enable_grad(),
-            sdp_kernel(
-                enable_flash=False, enable_mem_efficient=False, enable_math=True
-            ),
-        ):
-            base_outputs = model(input_ids, output_hidden_states=True)
-            logits_without_hook = base_outputs.logits
-        cap_handle.remove()
-        act_base = captured["act"]
-
-        seq_len = (
-            int(tokens.attention_mask[0].sum().item())
-            if "attention_mask" in tokens
-            else act_base.shape[1]
-        )
-
-        lss_middle_states = torch.zeros(
-            2,
-            seq_len,
-            model.config.vocab_size,
-            device=torch.device(args.device),
-            dtype=getattr(torch, args.dtype),
-        )  # [0, :] is the base state, [1, :] is the modified state
-
-        for i in range(args.alpha_factor):
-            concept_vector_alpha = args.concept_vector_alpha * (i + 1)
-
-            # Add hook to modify activations at the target layer
-            def _forward_hook(module, inputs, output):
-                # Ensure concept vector matches device/dtype
-                if isinstance(output, tuple):
-                    hidden = output[0]
-                    vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
-                    hidden = hidden - concept_vector_alpha * vec
-                    return (hidden,) + output[1:]
-                else:
-                    vec = concept_vector.to(device=output.device, dtype=output.dtype)
-                    return output - concept_vector_alpha * vec
-
-            hook_handle = target_layer_module.register_forward_hook(_forward_hook)
+            cap_handle = target_layer_module.register_forward_hook(_capture_hook)
             with (
                 torch.enable_grad(),
                 sdp_kernel(
                     enable_flash=False, enable_mem_efficient=False, enable_math=True
                 ),
             ):
-                outputs_with_hook = model(input_ids, output_hidden_states=True)
+                base_outputs = model(input_ids, output_hidden_states=True)
+                logits_without_hook = base_outputs.logits
+            cap_handle.remove()
+            act_base = captured["act"]
 
-            lss_middle_states = compute_line_shape_score_middle_states(
-                outputs_with_hook.logits[0, :seq_len, :],
-                logits_without_hook[0, :seq_len, :],
-                lss_middle_states,
-                i,
+            seq_len = (
+                int(tokens.attention_mask[0].sum().item())
+                if "attention_mask" in tokens
+                else act_base.shape[1]
             )
-            hook_handle.remove()
 
-        lss = compute_line_shape_score(
-            lss_middle_states[1, :, :],
-            logits_without_hook[0, :seq_len, :],
-            args.alpha_factor,
-        )
-        each_token_lss.extend(lss)
-        progress_bar.update(1)
-    progress_bar.close()
-    # After processing all contexts/examples: per-alpha mean/std over per-token increases
-    mean_lss = float(np.mean(each_token_lss))
-    std_lss = float(np.std(each_token_lss))
-    logger.info(f"Mean LSS: {mean_lss}")
-    logger.info(f"Std LSS: {std_lss}")
+            lss_middle_states = torch.zeros(
+                2,
+                seq_len,
+                model.config.vocab_size,
+                device=torch.device(args.device),
+                dtype=getattr(torch, args.dtype),
+            )  # [0, :] is the base state, [1, :] is the modified state
 
+            for i in range(args.alpha_factor):
+                concept_vector_alpha = args.concept_vector_alpha * (i + 1)
+
+                # Add hook to modify activations at the target layer
+                def _forward_hook(module, inputs, output):
+                    # Ensure concept vector matches device/dtype
+                    if isinstance(output, tuple):
+                        hidden = output[0]
+                        vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
+                        hidden = hidden + concept_vector_alpha * vec
+                        return (hidden,) + output[1:]
+                    else:
+                        vec = concept_vector.to(device=output.device, dtype=output.dtype)
+                        return output - concept_vector_alpha * vec
+
+                hook_handle = target_layer_module.register_forward_hook(_forward_hook)
+                with (
+                    torch.enable_grad(),
+                    sdp_kernel(
+                        enable_flash=False, enable_mem_efficient=False, enable_math=True
+                    ),
+                ):
+                    outputs_with_hook = model(input_ids, output_hidden_states=True)
+
+                lss_middle_states = compute_line_shape_score_middle_states(
+                    outputs_with_hook.logits[0, :seq_len, :],
+                    logits_without_hook[0, :seq_len, :],
+                    lss_middle_states,
+                    i,
+                )
+                hook_handle.remove()
+
+            lss = compute_line_shape_score(
+                lss_middle_states[1, :, :],
+                logits_without_hook[0, :seq_len, :],
+                args.alpha_factor,
+            )
+            each_token_lss.extend(lss)
+            progress_bar.update(1)
+        progress_bar.close()
+        # After processing all contexts/examples: per-alpha mean/std over per-token increases
+        mean_lss = float(np.mean(each_token_lss))
+        std_lss = float(np.std(each_token_lss))
+        logger.info(f"Mean LSS: {mean_lss}")
+        logger.info(f"Std LSS: {std_lss}")
+        torch.save(each_token_lss, f"weights/linearity/lss/linearity_lss_{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_random.pt")
 
 def compute_line_shape_score_middle_states(
     logits_with_hook, logits_without_hook, lss_middle_states, i
@@ -317,5 +323,173 @@ def compute_jvp(
     return base_jvp
 
 
+
+def linearity_token():
+    args = config()
+
+    # add logger
+    logger.add("logs/linearity.log")
+    logger.info("Starting linearity measurement...")
+    logger.info(f"Loading model: {args.model}")
+
+    # load model
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        device_map=args.device,
+        trust_remote_code=True,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        use_fast=True,
+    )
+
+    # load dataset
+    logger.info(f"Loading dataset: {args.dataset_path}")
+    dataset = datasets.load_dataset("json", data_files=args.dataset_path)["train"]
+    logger.info(f"Loaded {len(dataset)} examples")
+    logger.info(f"Loading concept vector: {args.concept_vector_path}")
+    concept_vectors = torch.load(args.concept_vector_path)
+    logger.info(f"Concept vector shape: {concept_vectors.shape}")
+
+    # measure the linearity of the model
+    if args.concept_category == "safety":
+        dataset_key = "instruction"
+    elif args.concept_category == "language_translation":
+        # TODO
+        dataset_key = "context"
+    else:
+        raise ValueError(f"Invalid concept category: {args.concept_category}")
+    layers = model.config.num_hidden_layers
+    logger.info(f"Measuring linearity for {layers} layers")
+    concept_vector = concept_vectors[2, :]
+    progress_bar = tqdm(total=args.max_dataset_size, desc="Measuring linearity")
+    each_token_lss = []
+    idy = 0
+    diff_list = []
+
+    for example in dataset:
+        context = example[dataset_key]
+        if idy > args.max_dataset_size:
+            break
+        idy += 1
+        tokens = tokenizer(context, return_tensors="pt", truncation=True).to(
+            args.device
+        )
+        input_ids = tokens.input_ids
+
+        layers_container = _get_layers_container(model)
+        target_layer_module = layers_container[2]
+
+        # 1) Capture the actual activation act_base at the target layer (participates in computation graph)
+        captured = {"act": None}
+
+        def _capture_hook(module, inputs, output):
+            out = output[0] if isinstance(output, tuple) else output
+            captured["act"] = out
+            return output
+
+        cap_handle = target_layer_module.register_forward_hook(_capture_hook)
+        with (
+            torch.enable_grad(),
+            sdp_kernel(
+                enable_flash=False, enable_mem_efficient=False, enable_math=True
+            ),
+        ):
+            base_outputs = model(input_ids, output_hidden_states=True)
+            logits_without_hook = base_outputs.logits
+        cap_handle.remove()
+        act_base = captured["act"]
+
+        seq_len = (
+            int(tokens.attention_mask[0].sum().item())
+            if "attention_mask" in tokens
+            else act_base.shape[1]
+        )
+
+        lss_middle_states = torch.zeros(
+            2,
+            seq_len,
+            model.config.vocab_size,
+            device=torch.device(args.device),
+            dtype=getattr(torch, args.dtype),
+        )  # [0, :] is the base state, [1, :] is the modified state
+
+        for i in range(args.alpha_factor):
+            concept_vector_alpha = args.concept_vector_alpha * (i + 1)
+
+            # Add hook to modify activations at the target layer
+            def _forward_hook(module, inputs, output):
+                # Ensure concept vector matches device/dtype
+                if isinstance(output, tuple):
+                    hidden = output[0]
+                    vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
+                    hidden = hidden + concept_vector_alpha * vec
+                    return (hidden,) + output[1:]
+                else:
+                    vec = concept_vector.to(device=output.device, dtype=output.dtype)
+                    return output - concept_vector_alpha * vec
+
+            hook_handle = target_layer_module.register_forward_hook(_forward_hook)
+            with (
+                torch.enable_grad(),
+                sdp_kernel(
+                    enable_flash=False, enable_mem_efficient=False, enable_math=True
+                ),
+            ):
+                outputs_with_hook = model(input_ids, output_hidden_states=True)
+
+            lss_middle_states = compute_line_shape_score_middle_states(
+                outputs_with_hook.logits[0, :seq_len, :],
+                logits_without_hook[0, :seq_len, :],
+                lss_middle_states,
+                i,
+            )
+            hook_handle.remove()
+
+        lss = compute_line_shape_score(
+            lss_middle_states[1, :, :],
+            logits_without_hook[0, :seq_len, :],
+            args.alpha_factor,
+        )
+        each_token_lss.extend(lss)
+        if max(lss) > 2:
+            indices = [i for i, val in enumerate(lss) if val > 2]
+            one_diff_list = []
+            for i in range(args.alpha_factor):
+                concept_vector_alpha = args.concept_vector_alpha * (i + 1)
+
+                # Add hook to modify activations at the target layer
+                def _forward_hook(module, inputs, output):
+                    # Ensure concept vector matches device/dtype
+                    if isinstance(output, tuple):
+                        hidden = output[0]
+                        vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
+                        hidden = hidden + concept_vector_alpha * vec
+                        return (hidden,) + output[1:]
+                    else:
+                        vec = concept_vector.to(device=output.device, dtype=output.dtype)
+                        return output - concept_vector_alpha * vec
+
+                hook_handle = target_layer_module.register_forward_hook(_forward_hook)
+                with (
+                    torch.enable_grad(),
+                    sdp_kernel(
+                        enable_flash=False, enable_mem_efficient=False, enable_math=True
+                    ),
+                ):
+                    outputs_with_hook = model(input_ids, output_hidden_states=True)
+                    diff = outputs_with_hook.logits[0, indices[0], :] - logits_without_hook[0, indices[0], :]
+                    diff_norm = torch.norm(diff, p=2)
+                    one_diff_list.append(diff_norm.item())
+                hook_handle.remove()
+            diff_list.append(one_diff_list)
+        progress_bar.update(1)
+    progress_bar.close()
+    # After processing all contexts/examples: per-alpha mean/std over per-token increases
+    torch.save(diff_list, f"weights/linearity/lss/linearity_diff_larger_than_2_pythia-70m_Layer2.pt")
+
+
+
 if __name__ == "__main__":
-    linearity()
+    linearity_token()

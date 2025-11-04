@@ -195,7 +195,7 @@ def random_concept_vector():
     parser.add_argument(
         "--model",
         type=str,
-        default="google/gemma-2-2b-it",
+        default="EleutherAI/pythia-70m",
         choices=["EleutherAI/pythia-70m", "google/gemma-2-2b-it"],
     )
     parser.add_argument("--device", type=str, default="cuda")
@@ -206,9 +206,10 @@ def random_concept_vector():
     )
     logger.info(f"Loading model: {args.model}")
     model_dimension = model.cfg.d_model
+    layers = model.cfg.n_layers
     logger.info(f"Model dimension: {model_dimension}")
-    random_concept_vector = torch.randn(model_dimension)
-    random_concept_vector = torch.nn.functional.normalize(random_concept_vector, dim=0)
+    random_concept_vector = torch.randn(layers, model_dimension)
+    random_concept_vector = torch.nn.functional.normalize(random_concept_vector, dim=1)
     random_concept_vector = random_concept_vector.to(args.device)
     os.makedirs("weights/concept_vectors", exist_ok=True)
     torch.save(
@@ -219,7 +220,7 @@ def random_concept_vector():
         f"Saved random concept vector to weights/concept_vectors/random_concept_vector_{args.model.split('/')[-1]}.pt"
     )
     logger.info(f"Random concept vector shape: {random_concept_vector.shape}")
-    logger.info(f"Random concept vector: {random_concept_vector.norm(dim=0).item()}")
+    logger.info(f"Random concept vector: {random_concept_vector.norm(dim=1)}")
     return random_concept_vector
 
 
