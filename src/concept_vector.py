@@ -11,6 +11,12 @@ from loguru import logger
 from tqdm import tqdm
 from typing import Union, List
 
+MODEL_LAYERS = {
+    "google/gemma-2-2b": 26,
+    "Qwen/Qwen3-1.7B": 28,
+    "EleutherAI/pythia-70m": 6,
+}
+
 
 def config():
     """config
@@ -22,7 +28,7 @@ def config():
     parser.add_argument(
         "--model",
         type=str,
-        default="EleutherAI/pythia-70m",
+        default="google/gemma-2-2b",
         choices=["google/gemma-2-2b", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
         help="the model to calculate the concept vector. TODO: add models with checkpoints and same model family",
     )
@@ -37,7 +43,7 @@ def config():
     parser.add_argument(
         "--concept_category",
         type=str,
-        default="random",
+        default="safety",
         choices=["safety", "language_en_fr", "random"],
         help="the category of the concept",
     )
@@ -48,6 +54,18 @@ def config():
         type=str,
         default="difference-in-means",
         choices=["IncrementalPCA", "difference-in-means", "rdo"],
+    )
+    parser.add_argument(
+        "--layer_num",
+        type=int,
+        default=0,
+        help="the number of layers, default is 0 and will be calculated automatically",
+    )
+    parser.add_argument(
+        "--max_dataset_size",
+        type=int,
+        default=300,
+        help="the maximum size of the dataset to calculate the concept vector",
     )
     args = parser.parse_args()
     return args
@@ -63,23 +81,21 @@ def concept_vector(save_path: str) -> None:
         None
     """
     args = config()
-    if args.model == "google/gemma-2-2b":
-        assert args.layer < 26 and args.layer >= -1, "layer must be between 0 and 25"
-        if args.layer == [-1]:
-            args.layer = list(range(26))
-            args.layer_num = 26
-    elif args.model == "Qwen/Qwen3-1.7B":
-        assert args.layer < 28 and args.layer >= -1, "layer must be between 0 and 27"
-        if args.layer == [-1]:
-            args.layer = list(range(28))
-            args.layer_num = 28
-    elif args.model == "EleutherAI/pythia-70m":
-        assert args.layer < 6 and args.layer >= -1, "layer must be between 0 and 5"
-        if args.layer == [-1]:
-            args.layer = list(range(6))
-            args.layer_num = 6
-    else:
+    max_layers = MODEL_LAYERS[args.model]
+
+    if -1 in args.layer:
+        args.layer = list(range(max_layers))
+    logger.info(f"Layer: {args.layer}")
+    args.layer_num = len(args.layer)
+    deepest_layer = max(args.layer)
+    shallowest_layer = min(args.layer)
+
+    if args.model not in MODEL_LAYERS:
         raise ValueError(f"Invalid model: {args.model}")
+
+    assert (
+        -1 <= shallowest_layer < max_layers and deepest_layer < max_layers
+    ), f"layer must be between 0 and {max_layers - 1}"
 
     # add logger
     logger.add("logs/concept_vector.log")
@@ -90,16 +106,7 @@ def concept_vector(save_path: str) -> None:
         # for all binary dataset, use two datasets to calculate the concept vector
         safety_concept_vector(args, save_path)
     elif args.concept_category == "language_en_fr":
-        dataset_folder = "assets/language_translation"
-        english_dataset_path = os.path.join(dataset_folder, "english_data.jsonl")
-        french_dataset_path = os.path.join(dataset_folder, "french_data.jsonl")
-        positive_dataset = datasets.load_dataset(
-            "json", data_files=english_dataset_path
-        )["train"]
-        negative_dataset = datasets.load_dataset(
-            "json", data_files=french_dataset_path
-        )["train"]
-        datset_key = "instruction"
+        language_en_fr_concept_vector(args, save_path)
     elif args.concept_category == "random":
         random_concept_vector(args, save_path)
     else:
@@ -137,7 +144,7 @@ class DifferenceInMeans:
             self.layers = list(range(self.model.cfg.n_layers))
             logger.info(f"Calculating concept vectors for all layers: {self.layers}")
         else:
-            self.layers = [layer]
+            self.layers = layer
             logger.info(f"Calculating concept vectors for layer: {layer}")
         self.device = device
         self.positive_dataset_key = positive_dataset_key
@@ -231,16 +238,16 @@ def safety_concept_vector(args: argparse.Namespace, save_path: str) -> None:
         layer=args.layer_num,
     )
     get_concept_vectors(
-        model,
-        positive_dataset,
-        negative_dataset,
-        args.layer,
-        args.device,
-        positive_dataset_key,
-        negative_dataset_key,
-        args.max_dataset_size,
-        save_path,
-        args.methods,
+        model=model,
+        positive_dataset=positive_dataset,
+        negative_dataset=negative_dataset,
+        layer=args.layer,
+        device=args.device,
+        positive_dataset_key=positive_dataset_key,
+        negative_dataset_key=negative_dataset_key,
+        save_path=save_path,
+        methods=args.methods,
+        max_dataset_size=args.max_dataset_size,
     )
 
 
@@ -252,8 +259,8 @@ def get_concept_vectors(
     device: str,
     positive_dataset_key: str,
     negative_dataset_key: str,
-    save_path: str,
     methods: str,
+    save_path: str,
     max_dataset_size: int = 300,
 ) -> None:
     """used to get the concept vectors using the specified method
@@ -294,7 +301,7 @@ def get_concept_vectors(
 
 def language_en_fr_concept_vector(args: argparse.Namespace, save_path: str) -> None:
     dataset_folder = "assets/language_translation"
-    en_fr_dataset_path = os.path.join(dataset_folder, "en_fr.jsonl")
+    en_fr_dataset_path = os.path.join(dataset_folder, "en-fr.jsonl")
     dataset = datasets.load_dataset("json", data_files=en_fr_dataset_path)["train"]
     positive_dataset_key = "contexts0"
     negative_dataset_key = "contexts1"
@@ -303,21 +310,21 @@ def language_en_fr_concept_vector(args: argparse.Namespace, save_path: str) -> N
     )
     save_path = save_path.format(
         model_name=args.model.split("/")[-1],
-        method="difference-in-means",
+        method=args.methods,
         concept_category="language_en_fr",
         layer=args.layer_num,
     )
     get_concept_vectors(
-        model,
-        dataset,
-        dataset,
-        args.layer,
-        args.device,
-        positive_dataset_key,
-        negative_dataset_key,
-        args.max_dataset_size,
-        save_path,
-        args.methods,
+        model=model,
+        positive_dataset=dataset,
+        negative_dataset=dataset,
+        layer=args.layer,
+        device=args.device,
+        positive_dataset_key=positive_dataset_key,
+        negative_dataset_key=negative_dataset_key,
+        methods=args.methods,
+        save_path=save_path,
+        max_dataset_size=args.max_dataset_size,
     )
 
 
