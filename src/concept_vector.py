@@ -28,7 +28,7 @@ def config():
     parser.add_argument(
         "--model",
         type=str,
-        default="google/gemma-2-2b",
+        default="Qwen/Qwen3-1.7B",
         choices=["google/gemma-2-2b", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
         help="the model to calculate the concept vector. TODO: add models with checkpoints and same model family",
     )
@@ -43,7 +43,7 @@ def config():
     parser.add_argument(
         "--concept_category",
         type=str,
-        default="safety",
+        default="language_en_fr",
         choices=["safety", "language_en_fr", "random"],
         help="the category of the concept",
     )
@@ -124,6 +124,7 @@ class DifferenceInMeans:
         positive_dataset_key: str,
         negative_dataset_key: str,
         max_dataset_size: int = 300,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         """used to calculate the concept vector using difference-in-means
 
@@ -150,6 +151,7 @@ class DifferenceInMeans:
         self.positive_dataset_key = positive_dataset_key
         self.negative_dataset_key = negative_dataset_key
         self.max_dataset_size = max_dataset_size
+        self.dtype = dtype
 
     def get_concept_vectors(self, save_path: str, is_save: bool = False):
         """used to calculate the concept vectors using difference-in-means
@@ -164,52 +166,52 @@ class DifferenceInMeans:
         model_dimension = self.model.cfg.d_model
         layer_length = len(self.layers)
         positive_concept_vector = torch.zeros(
-            layer_length, model_dimension, device=self.device
+            layer_length, model_dimension, device=self.device, dtype=self.dtype
         )
         negative_concept_vector = torch.zeros(
-            layer_length, model_dimension, device=self.device
+            layer_length, model_dimension, device=self.device, dtype=self.dtype
         )
         positive_token_length = 0
         negative_token_length = 0
-        only_once = True
-        for i, example in enumerate(
-            tqdm(self.positive_dataset, desc="Calculating positive concept vectors")
-        ):
+        for i, example in tqdm(enumerate(self.positive_dataset), total=len(self.positive_dataset)):
             if i >= self.max_dataset_size:
                 break
             torch.cuda.empty_cache()
             gc.collect()
             context = example[self.positive_dataset_key]
-            _, positive_cache = self.model.run_with_cache(context)
+            _, positive_cache = self.model.run_with_cache(
+                context
+            )
             for layer in self.layers:
                 positive_hidden_state = positive_cache[
                     f"blocks.{layer}.hook_resid_post"
                 ].reshape(-1, model_dimension)
-                current_token_length = positive_hidden_state.shape[0]
                 positive_concept_vector[layer] += positive_hidden_state.sum(dim=0)
-                positive_token_length += current_token_length
+                if layer == 0:
+                    current_token_length = positive_hidden_state.shape[0]
+                    positive_token_length += current_token_length
 
-        for i, example in enumerate(
-            tqdm(self.negative_dataset, desc="Calculating negative concept vectors")
-        ):
+        for i, example in tqdm(enumerate(self.negative_dataset), total=len(self.negative_dataset)):
             if i >= self.max_dataset_size:
                 break
             torch.cuda.empty_cache()
             gc.collect()
             context = example[self.negative_dataset_key]
-            _, negative_cache = self.model.run_with_cache(context)
+            _, negative_cache = self.model.run_with_cache(context, stop_at_layer=layer+1)
             for layer in self.layers:
                 negative_hidden_state = negative_cache[
                     f"blocks.{layer}.hook_resid_post"
                 ].reshape(-1, model_dimension)
-                current_token_length = negative_hidden_state.shape[0]
                 negative_concept_vector[layer] += negative_hidden_state.sum(dim=0)
-                negative_token_length += current_token_length
+                if layer == 0:
+                    current_token_length = negative_hidden_state.shape[0]
+                    negative_token_length += current_token_length
         positive_concept_vector /= positive_token_length
         negative_concept_vector /= negative_token_length
         concept_diff = positive_concept_vector - negative_concept_vector
         concept_diff = torch.nn.functional.normalize(concept_diff, dim=1)
 
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(concept_diff, save_path)
         logger.info(f"Concept vector shape: {concept_diff.shape}")
         logger.info(f"Concept vector: {concept_diff.norm(dim=1)}")
@@ -301,10 +303,12 @@ def get_concept_vectors(
 
 def language_en_fr_concept_vector(args: argparse.Namespace, save_path: str) -> None:
     dataset_folder = "assets/language_translation"
-    en_fr_dataset_path = os.path.join(dataset_folder, "en-fr.jsonl")
-    dataset = datasets.load_dataset("json", data_files=en_fr_dataset_path)["train"]
-    positive_dataset_key = "contexts0"
-    negative_dataset_key = "contexts1"
+    en_dataset_path = os.path.join(dataset_folder, "en.jsonl")
+    fr_dataset_path = os.path.join(dataset_folder, "fr.jsonl")
+    en_dataset = datasets.load_dataset("json", data_files=en_dataset_path)["train"]
+    fr_dataset = datasets.load_dataset("json", data_files=fr_dataset_path)["train"]
+    positive_dataset_key = "text"
+    negative_dataset_key = "text"
     model = transformer_lens.HookedTransformer.from_pretrained(
         args.model, device=args.device, dtype=args.dtype
     )
@@ -316,8 +320,8 @@ def language_en_fr_concept_vector(args: argparse.Namespace, save_path: str) -> N
     )
     get_concept_vectors(
         model=model,
-        positive_dataset=dataset,
-        negative_dataset=dataset,
+        positive_dataset=en_dataset,
+        negative_dataset=fr_dataset,
         layer=args.layer,
         device=args.device,
         positive_dataset_key=positive_dataset_key,
