@@ -9,39 +9,77 @@ import gc
 from sklearn.decomposition import IncrementalPCA
 from loguru import logger
 from tqdm import tqdm
+from typing import Union, List
 
 
-def concept_vector():
-    """used to calculate the concept vector of the model"""
-
-    # configure the arguments
+def config():
+    """config
+    Returns:
+        argparse.Namespace: the arguments
+    """
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
         type=str,
         default="EleutherAI/pythia-70m",
-        choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
+        choices=["google/gemma-2-2b", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
+        help="the model to calculate the concept vector. TODO: add models with checkpoints and same model family",
     )
     parser.add_argument(
         "--layer",
+        nargs="+",
         type=int,
-        default=-1,
+        default=[-1],
         help="the layer to calculate the concept vector, -1 means the all layers",
     )
 
     parser.add_argument(
-        "--concept_category", type=str, default="safety", choices=["safety", "language"]
+        "--concept_category",
+        type=str,
+        default="random",
+        choices=["safety", "language_en_fr", "random"],
+        help="the category of the concept",
     )
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument(
         "--methods",
         type=str,
         default="difference-in-means",
-        choices=["IncrementalPCA", "difference-in-means"],
+        choices=["IncrementalPCA", "difference-in-means", "rdo"],
     )
     args = parser.parse_args()
+    return args
+
+
+def concept_vector(save_path: str) -> None:
+    """used to calculate the concept vector using difference-in-means
+
+    Args:
+        save_path (str): the path to save the concept vectors
+
+    Returns:
+        None
+    """
+    args = config()
+    if args.model == "google/gemma-2-2b":
+        assert args.layer < 26 and args.layer >= -1, "layer must be between 0 and 25"
+        if args.layer == [-1]:
+            args.layer = list(range(26))
+            args.layer_num = 26
+    elif args.model == "Qwen/Qwen3-1.7B":
+        assert args.layer < 28 and args.layer >= -1, "layer must be between 0 and 27"
+        if args.layer == [-1]:
+            args.layer = list(range(28))
+            args.layer_num = 28
+    elif args.model == "EleutherAI/pythia-70m":
+        assert args.layer < 6 and args.layer >= -1, "layer must be between 0 and 5"
+        if args.layer == [-1]:
+            args.layer = list(range(6))
+            args.layer_num = 6
+    else:
+        raise ValueError(f"Invalid model: {args.model}")
 
     # add logger
     logger.add("logs/concept_vector.log")
@@ -50,43 +88,22 @@ def concept_vector():
     # capture the dataset path
     if args.concept_category == "safety":
         # for all binary dataset, use two datasets to calculate the concept vector
-        dataset_folder = "assets/harmbench"
-        harmful_dataset_path = os.path.join(dataset_folder, "harmful_data.jsonl")
-        harmless_dataset_path = os.path.join(dataset_folder, "harmless_data.jsonl")
+        safety_concept_vector(args, save_path)
+    elif args.concept_category == "language_en_fr":
+        dataset_folder = "assets/language_translation"
+        english_dataset_path = os.path.join(dataset_folder, "english_data.jsonl")
+        french_dataset_path = os.path.join(dataset_folder, "french_data.jsonl")
         positive_dataset = datasets.load_dataset(
-            "json", data_files=harmful_dataset_path
+            "json", data_files=english_dataset_path
         )["train"]
         negative_dataset = datasets.load_dataset(
-            "json", data_files=harmless_dataset_path
+            "json", data_files=french_dataset_path
         )["train"]
         datset_key = "instruction"
-    elif args.concept_category == "language":
-        dataset_folder = "assets/language_translation"
-        # TODO: add the language translation dataset path
+    elif args.concept_category == "random":
+        random_concept_vector(args, save_path)
     else:
         raise ValueError(f"Invalid concept category: {args.concept_category}")
-
-    logger.info(f"Loading model: {args.model}")
-    model = transformer_lens.HookedTransformer.from_pretrained(
-        args.model, device=args.device, dtype=args.dtype
-    )
-
-    if args.methods == "difference-in-means":
-        logger.info(f"Calculating concept vectors using difference-in-means...")
-        difference_in_means = DifferenceInMeans(
-            model,
-            positive_dataset,
-            negative_dataset,
-            layer=args.layer,
-            device=args.device,
-            dataset_key=datset_key,
-        )
-        concept_vectors = difference_in_means.get_concept_vectors(
-            save_path=f"weights/concept_vectors/{args.model.split('/')[-1]}_Layer{args.layer}_{args.methods}_{args.concept_category}.pt",
-            is_save=True,
-        )
-    else:
-        raise ValueError(f"Invalid method: {args.methods}")
 
 
 class DifferenceInMeans:
@@ -97,7 +114,8 @@ class DifferenceInMeans:
         negative_dataset: datasets.Dataset,
         layer: int,
         device: str,
-        dataset_key: str,
+        positive_dataset_key: str,
+        negative_dataset_key: str,
         max_dataset_size: int = 300,
     ):
         """used to calculate the concept vector using difference-in-means
@@ -108,7 +126,8 @@ class DifferenceInMeans:
             negative_dataset (datasets.Dataset): the negative dataset to calculate the concept vector
             layer (int): the layer to calculate the concept vector
             device (str): the device to calculate the concept vector
-            dataset_key (str): the key of the dataset to calculate the concept vector
+            positive_dataset_key (str): the key of the positive dataset to calculate the concept vector
+            negative_dataset_key (str): the key of the negative dataset to calculate the concept vector
             max_dataset_size (int, optional): the maximum size of the dataset to calculate the concept vector. Defaults to 300.
         """
         self.model = model
@@ -121,7 +140,8 @@ class DifferenceInMeans:
             self.layers = [layer]
             logger.info(f"Calculating concept vectors for layer: {layer}")
         self.device = device
-        self.dataset_key = dataset_key
+        self.positive_dataset_key = positive_dataset_key
+        self.negative_dataset_key = negative_dataset_key
         self.max_dataset_size = max_dataset_size
 
     def get_concept_vectors(self, save_path: str, is_save: bool = False):
@@ -145,14 +165,14 @@ class DifferenceInMeans:
         positive_token_length = 0
         negative_token_length = 0
         only_once = True
-        for i, example in enumerate(tqdm(
-            self.positive_dataset, desc="Calculating positive concept vectors"
-        )):
+        for i, example in enumerate(
+            tqdm(self.positive_dataset, desc="Calculating positive concept vectors")
+        ):
             if i >= self.max_dataset_size:
                 break
             torch.cuda.empty_cache()
             gc.collect()
-            context = example[self.dataset_key]
+            context = example[self.positive_dataset_key]
             _, positive_cache = self.model.run_with_cache(context)
             for layer in self.layers:
                 positive_hidden_state = positive_cache[
@@ -161,15 +181,15 @@ class DifferenceInMeans:
                 current_token_length = positive_hidden_state.shape[0]
                 positive_concept_vector[layer] += positive_hidden_state.sum(dim=0)
                 positive_token_length += current_token_length
-                
-        for i, example in enumerate(tqdm(
-            self.negative_dataset, desc="Calculating negative concept vectors"
-        )):
+
+        for i, example in enumerate(
+            tqdm(self.negative_dataset, desc="Calculating negative concept vectors")
+        ):
             if i >= self.max_dataset_size:
                 break
             torch.cuda.empty_cache()
             gc.collect()
-            context = example[self.dataset_key]
+            context = example[self.negative_dataset_key]
             _, negative_cache = self.model.run_with_cache(context)
             for layer in self.layers:
                 negative_hidden_state = negative_cache[
@@ -189,42 +209,155 @@ class DifferenceInMeans:
         return concept_diff
 
 
-def random_concept_vector():
-    """used to calculate the random concept vector of the model"""
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="EleutherAI/pythia-70m",
-        choices=["EleutherAI/pythia-70m", "google/gemma-2-2b-it"],
-    )
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
-    args = parser.parse_args()
+def safety_concept_vector(args: argparse.Namespace, save_path: str) -> None:
+    dataset_folder = "assets/harmbench"
+    harmful_dataset_path = os.path.join(dataset_folder, "harmful_data.jsonl")
+    harmless_dataset_path = os.path.join(dataset_folder, "harmless_data.jsonl")
+    positive_dataset = datasets.load_dataset("json", data_files=harmful_dataset_path)[
+        "train"
+    ]
+    negative_dataset = datasets.load_dataset("json", data_files=harmless_dataset_path)[
+        "train"
+    ]
+    positive_dataset_key = "instruction"
+    negative_dataset_key = "instruction"
     model = transformer_lens.HookedTransformer.from_pretrained(
         args.model, device=args.device, dtype=args.dtype
     )
-    logger.info(f"Loading model: {args.model}")
-    model_dimension = model.cfg.d_model
-    layers = model.cfg.n_layers
-    logger.info(f"Model dimension: {model_dimension}")
-    random_concept_vector = torch.randn(layers, model_dimension)
+    save_path = save_path.format(
+        model_name=args.model.split("/")[-1],
+        method="difference-in-means",
+        concept_category="safety",
+        layer=args.layer_num,
+    )
+    get_concept_vectors(
+        model,
+        positive_dataset,
+        negative_dataset,
+        args.layer,
+        args.device,
+        positive_dataset_key,
+        negative_dataset_key,
+        args.max_dataset_size,
+        save_path,
+        args.methods,
+    )
+
+
+def get_concept_vectors(
+    model: transformer_lens.HookedTransformer,
+    positive_dataset: datasets.Dataset,
+    negative_dataset: datasets.Dataset,
+    layer: int,
+    device: str,
+    positive_dataset_key: str,
+    negative_dataset_key: str,
+    save_path: str,
+    methods: str,
+    max_dataset_size: int = 300,
+) -> None:
+    """used to get the concept vectors using the specified method
+
+    Args:
+        model (transformer_lens.HookedTransformer): the model to get the concept vectors
+        positive_dataset (datasets.Dataset): the positive dataset to get the concept vectors
+        negative_dataset (datasets.Dataset): the negative dataset to get the concept vectors
+        layer (int): the layer to get the concept vectors
+        device (str): the device to get the concept vectors
+        positive_dataset_key (str): the key of the positive dataset to get the concept vectors
+        negative_dataset_key (str): the key of the negative dataset to get the concept vectors
+        save_path (str): the path to save the concept vectors
+        methods (str): the method to get the concept vectors
+        max_dataset_size (int, optional): the maximum size of the dataset to get the concept vectors. Defaults to 300.
+
+    Returns:
+        None
+    """
+    if methods == "difference-in-means":
+        difference_in_means = DifferenceInMeans(
+            model,
+            positive_dataset,
+            negative_dataset,
+            layer=layer,
+            device=device,
+            positive_dataset_key=positive_dataset_key,
+            negative_dataset_key=negative_dataset_key,
+            max_dataset_size=max_dataset_size,
+        )
+        difference_in_means.get_concept_vectors(
+            save_path=save_path,
+            is_save=True,
+        )
+    else:
+        raise ValueError(f"Invalid method: {methods}")
+
+
+def language_en_fr_concept_vector(args: argparse.Namespace, save_path: str) -> None:
+    dataset_folder = "assets/language_translation"
+    en_fr_dataset_path = os.path.join(dataset_folder, "en_fr.jsonl")
+    dataset = datasets.load_dataset("json", data_files=en_fr_dataset_path)["train"]
+    positive_dataset_key = "contexts0"
+    negative_dataset_key = "contexts1"
+    model = transformer_lens.HookedTransformer.from_pretrained(
+        args.model, device=args.device, dtype=args.dtype
+    )
+    save_path = save_path.format(
+        model_name=args.model.split("/")[-1],
+        method="difference-in-means",
+        concept_category="language_en_fr",
+        layer=args.layer_num,
+    )
+    get_concept_vectors(
+        model,
+        dataset,
+        dataset,
+        args.layer,
+        args.device,
+        positive_dataset_key,
+        negative_dataset_key,
+        args.max_dataset_size,
+        save_path,
+        args.methods,
+    )
+
+
+def random_concept_vector(args: argparse.Namespace, save_path: str) -> None:
+    """Generate a random concept vector for the model
+    Args:
+        args (argparse.Namespace): the arguments
+        save_path (str): the path to save the concept vectors
+
+    Returns:
+        None
+    """
+    save_path = save_path.format(
+        model_name=args.model.split("/")[-1],
+        method="random",
+        concept_category="random",
+        layer=args.layer_num,
+    )
+    if args.model == "google/gemma-2-2b":
+        model_dimension = 2304
+    elif args.model == "Qwen/Qwen3-1.7B":
+        model_dimension = 2048
+    elif args.model == "EleutherAI/pythia-70m":
+        model_dimension = 512
+    else:
+        raise ValueError(f"Invalid model: {args.model}")
+
+    save_path_folder = os.path.dirname(save_path)
+    logger.info(f"Save path: {save_path}")
+    os.makedirs(save_path_folder, exist_ok=True)
+    random_concept_vector = torch.randn(args.layer_num, model_dimension)
     random_concept_vector = torch.nn.functional.normalize(random_concept_vector, dim=1)
-    random_concept_vector = random_concept_vector.to(args.device)
-    os.makedirs("weights/concept_vectors", exist_ok=True)
-    torch.save(
-        random_concept_vector,
-        f"weights/concept_vectors/random_concept_vector_{args.model.split('/')[-1]}.pt",
-    )
-    logger.info(
-        f"Saved random concept vector to weights/concept_vectors/random_concept_vector_{args.model.split('/')[-1]}.pt"
-    )
+    torch.save(random_concept_vector, save_path)
+    logger.info(f"Saved random concept vector to {save_path}")
     logger.info(f"Random concept vector shape: {random_concept_vector.shape}")
     logger.info(f"Random concept vector: {random_concept_vector.norm(dim=1)}")
     return random_concept_vector
 
 
 if __name__ == "__main__":
-    random_concept_vector()
+    save_path = "weights/concept_vectors/{model_name}/{method}/{concept_category}_layer{layer}.pt"
 
-    # concept_vector()
+    concept_vector(save_path)
