@@ -6,6 +6,7 @@ import numpy as np
 from loguru import logger
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import Union
 
 
 def config():
@@ -17,7 +18,7 @@ def config():
     parser.add_argument(
         "--model",
         type=str,
-        default="EleutherAI/pythia-70m",
+        default="google/gemma-2-2b-it",
         choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
     )
     parser.add_argument(
@@ -36,7 +37,7 @@ def config():
     parser.add_argument(
         "--concept_vector_path",
         type=str,
-        default="weights/concept_vectors/pythia-70m/difference-in-means/safety_layer6.pt",
+        default="weights/concept_vectors/gemma-2-2b/difference-in-means/safety_layer26.pt",
         choices=[
             "weights/concept_vectors/pythia-70m/difference-in-means/safety_layer6.pt",
             "weights/concept_vectors/pythia-70m/difference-in-means/language_en_fr_layer6.pt",
@@ -56,6 +57,11 @@ def config():
         default="lsr",
         choices=["lss", "lsr", "simple_angle"],
     )
+    parser.add_argument(
+        "--influence_layer", type=str, default="all", choices=["logits", "all"]
+    )
+    parser.add_argument("--steering_layer", type=int, default=3)
+    parser.add_argument("--steering_layer_step", type=int, default=3)
     args = parser.parse_args()
     return args
 
@@ -98,9 +104,18 @@ def linearity():
         dataset_key = "instruction"
     else:
         raise ValueError(f"Invalid dataset path: {args.dataset_path}")
+    if args.influence_layer == "logits":
+        influence_layers = range(model.config.num_hidden_layers)
+        linearity_layers = [-1]
+    else:
+        influence_layers = [args.steering_layer]
+        linearity_layers = range(
+            args.steering_layer + 1,
+            model.config.num_hidden_layers,
+            args.steering_layer_step,
+        )
 
-    layers = model.config.num_hidden_layers
-    logger.info(f"Measuring linearity for {layers} layers")
+    logger.info(f"Measuring linearity for {len(influence_layers)} layers")
     dataset_nums = args.max_dataset_nums
     input_prompts = dataset[:dataset_nums][dataset_key]
 
@@ -126,155 +141,168 @@ def linearity():
             if layers is not None:
                 return layers
         raise AttributeError("Unable to locate transformer layers container on model")
+    for linearity_layer in tqdm(linearity_layers, desc="Measuring linearity for linearity layers"):
+        for layer_idx in tqdm(influence_layers, desc="Measuring linearity"):
+            concept_vector = concept_vectors[layer_idx, :]
+            # Set padding token if not already set
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
-    for layer_idx in tqdm(range(layers), desc="Measuring linearity"):
-        concept_vector = concept_vectors[layer_idx, :]
-        # Set padding token if not already set
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+            input_ids = tokenizer(
+                input_prompts, return_tensors="pt", truncation=True, padding=True
+            ).to(args.device)
+            input_ids = input_ids.input_ids
+            layers_container = _get_layers_container(model)
+            target_layer_module = layers_container[layer_idx]
 
-        input_ids = tokenizer(
-            input_prompts, return_tensors="pt", truncation=True, padding=True
-        ).to(args.device)
-        input_ids = input_ids.input_ids
-        layers_container = _get_layers_container(model)
-        target_layer_module = layers_container[layer_idx]
-
-        captured = {"act": None}
-
-        original_output = model(input_ids, output_hidden_states=True)
-        logits_without_hook = original_output.logits
-        seq_len = logits_without_hook.shape[1]
-        if args.linearity_metric == "lss":
-            linearity_middle_states = torch.zeros(
-                2,
-                seq_len * dataset_nums,
-                model.config.vocab_size,
-                device=torch.device(args.device),
-                dtype=torch.float32,
-            )  # [0, :] is the base state, [1, :] is the modified state
-        elif args.linearity_metric == "lsr":
-            last_logits_with_hook = (
-                logits_without_hook.reshape(-1, model.config.vocab_size)
-                .detach()
-                .to(torch.float32)
-            )
-            seq_diff_norm = torch.zeros(
-                last_logits_with_hook.shape[0],
-                device=torch.device(args.device),
-                dtype=torch.float32,
-            )
-        elif args.linearity_metric == "simple_angle":
-            last_logits_with_hook = torch.zeros(
-                2,
-                seq_len * dataset_nums,
-                model.config.vocab_size,
-                device=torch.device(args.device),
-                dtype=torch.float32,
-            )
-            last_logits_with_hook[0, :, :] = logits_without_hook.reshape(-1, model.config.vocab_size).detach().to(torch.float32)
-            simple_angles = torch.zeros(
-                last_logits_with_hook.shape[1],
-                args.alpha_factor - 1,
-                device=torch.device(args.device),
-                dtype=torch.float32,
-            )
-        else:
-            raise ValueError(f"Invalid linearity metric: {args.linearity_metric}")
-
-        for i in tqdm(range(args.alpha_factor), desc="Measuring linearity"):
-            concept_vector_alpha = args.concept_vector_alpha * (i + 1)
-
-            def _forward_hook(module, inputs, output):
-                # Ensure concept vector matches device/dtype
-                if isinstance(output, tuple):
-                    hidden = output[0]
-                    vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
-                    hidden = hidden + concept_vector_alpha * vec
-                    return (hidden,) + output[1:]
-                else:
-                    vec = concept_vector.to(device=output.device, dtype=output.dtype)
-                    return output - concept_vector_alpha * vec
-
-            hook_handle = target_layer_module.register_forward_hook(_forward_hook)
-
-            logits_with_hook = model(input_ids, output_hidden_states=True)
-            logits_with_hook = logits_with_hook.logits
+            original_output = model(input_ids, output_hidden_states=True)
+            if args.influence_layer == "logits":
+                logits_without_hook = original_output.logits
+                dim_middle_states = model.config.vocab_size
+            else:
+                logits_without_hook = original_output.hidden_states[linearity_layer]
+                dim_middle_states = original_output.hidden_states[0].shape[-1]
+            seq_len = logits_without_hook.shape[1]
             if args.linearity_metric == "lss":
-                linearity_middle_states = compute_line_shape_score_middle_states(
-                    logits_with_hook.reshape(-1, model.config.vocab_size)
-                    .detach()
-                    .to(torch.float32),
-                    logits_without_hook.reshape(-1, model.config.vocab_size)
-                    .detach()
-                    .to(torch.float32),
-                    linearity_middle_states,
-                    i,
-                )
+                linearity_middle_states = torch.zeros(
+                    2,
+                    seq_len * dataset_nums,
+                    dim_middle_states,
+                    device=torch.device(args.device),
+                    dtype=torch.float32,
+                )  # [0, :] is the base state, [1, :] is the modified state
             elif args.linearity_metric == "lsr":
-                last_logits_with_hook, seq_diff_norm = compute_lsr_middle_states(
-                    logits_with_hook.reshape(-1, model.config.vocab_size)
+                last_logits_with_hook = (
+                    logits_without_hook.reshape(-1, dim_middle_states)
                     .detach()
-                    .to(torch.float32),
-                    last_logits_with_hook,
-                    logits_without_hook.reshape(-1, model.config.vocab_size)
-                    .detach()
-                    .to(torch.float32),
-                    seq_diff_norm,
-                    i,
-                    args.alpha_factor,
+                    .to(torch.float32)
+                )
+                seq_diff_norm = torch.zeros(
+                    last_logits_with_hook.shape[0],
+                    device=torch.device(args.device),
+                    dtype=torch.float32,
                 )
             elif args.linearity_metric == "simple_angle":
-                last_logits_with_hook, simple_angles = (
-                    compute_simple_angle_middle_states(
-                        logits_with_hook.reshape(-1, model.config.vocab_size)
-                        .detach()
-                        .to(torch.float32),
-                        last_logits_with_hook,
-                        simple_angles,
-                        i,
-                    )
+                last_logits_with_hook = torch.zeros(
+                    2,
+                    seq_len * dataset_nums,
+                    dim_middle_states,
+                    device=torch.device(args.device),
+                    dtype=torch.float32,
+                )
+                last_logits_with_hook[0, :, :] = (
+                    logits_without_hook.reshape(-1, dim_middle_states)
+                    .detach()
+                    .to(torch.float32)
+                )
+                simple_angles = torch.zeros(
+                    last_logits_with_hook.shape[1],
+                    args.alpha_factor - 1,
+                    device=torch.device(args.device),
+                    dtype=torch.float32,
                 )
             else:
                 raise ValueError(f"Invalid linearity metric: {args.linearity_metric}")
-            hook_handle.remove()
-        if args.linearity_metric == "lss":
-            lss = compute_line_shape_score(
-                linearity_middle_states[1, :, :],
-                logits_without_hook.reshape(-1, model.config.vocab_size)
-                .detach()
-                .to(torch.float32),
-                args.alpha_factor,
-            )
-            mean_lss = float(np.mean(lss))
-            std_lss = float(np.std(lss))
-            logger.info(f"Mean LSS: {mean_lss}")
-            logger.info(f"Std LSS: {std_lss}")
-            os.makedirs(f"weights/linearity/lss", exist_ok=True)
-            torch.save(
-                lss,
-                f"weights/linearity/lss/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}.pt",
-            )
-        elif args.linearity_metric == "lsr":
-            seq_diff_norm_cpu = seq_diff_norm.cpu().numpy()
-            logger.info(f"Mean LSR: {float(np.mean(seq_diff_norm_cpu))}")
-            logger.info(f"Std LSR: {float(np.std(seq_diff_norm_cpu))}")
-            os.makedirs(f"weights/linearity/lsr", exist_ok=True)
-            torch.save(
-                seq_diff_norm,
-                f"weights/linearity/lsr/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}.pt",
-            )
-        elif args.linearity_metric == "simple_angle":
-            simple_angles_cpu = simple_angles.cpu().numpy()
-            logger.info(f"Mean Simple Angle: {float(np.mean(simple_angles_cpu))}")
-            logger.info(f"Std Simple Angle: {float(np.std(simple_angles_cpu))}")
-            os.makedirs(f"weights/linearity/simple_angle", exist_ok=True)
-            torch.save(
-                simple_angles,
-                f"weights/linearity/simple_angle/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}.pt",
-            )
-        else:
-            raise ValueError(f"Invalid linearity metric: {args.linearity_metric}")
+
+            for i in tqdm(
+                range(args.alpha_factor), desc="Measuring linearity"
+            ):  # TODO: for is slow?
+                concept_vector_alpha = args.concept_vector_alpha * (i + 1)
+
+                def _forward_hook(module, inputs, output):
+                    # Ensure concept vector matches device/dtype
+                    if isinstance(output, tuple):
+                        hidden = output[0]
+                        vec = concept_vector.to(device=hidden.device, dtype=hidden.dtype)
+                        hidden = hidden + concept_vector_alpha * vec
+                        return (hidden,) + output[1:]
+                    else:
+                        vec = concept_vector.to(device=output.device, dtype=output.dtype)
+                        return output - concept_vector_alpha * vec
+
+                hook_handle = target_layer_module.register_forward_hook(_forward_hook)
+
+                logits_with_hook = model(input_ids, output_hidden_states=True)
+                if args.influence_layer == "logits":
+                    logits_with_hook = logits_with_hook.logits
+                else:
+                    logits_with_hook = logits_with_hook.hidden_states[linearity_layer]
+
+                if args.linearity_metric == "lss":
+                    linearity_middle_states = compute_line_shape_score_middle_states(
+                        logits_with_hook.reshape(-1, dim_middle_states)
+                        .detach()
+                        .to(torch.float32),
+                        logits_without_hook.reshape(-1, dim_middle_states)
+                        .detach()
+                        .to(torch.float32),
+                        linearity_middle_states,
+                        i,
+                    )
+                elif args.linearity_metric == "lsr":
+                    last_logits_with_hook, seq_diff_norm = compute_lsr_middle_states(
+                        logits_with_hook.reshape(-1, dim_middle_states)
+                        .detach()
+                        .to(torch.float32),
+                        last_logits_with_hook,
+                        logits_without_hook.reshape(-1, dim_middle_states)
+                        .detach()
+                        .to(torch.float32),
+                        seq_diff_norm,
+                        i,
+                        args.alpha_factor,
+                    )
+                elif args.linearity_metric == "simple_angle":
+                    last_logits_with_hook, simple_angles = (
+                        compute_simple_angle_middle_states(
+                            logits_with_hook.reshape(-1, dim_middle_states)
+                            .detach()
+                            .to(torch.float32),
+                            last_logits_with_hook,
+                            simple_angles,
+                            i,
+                        )
+                    )
+                else:
+                    raise ValueError(f"Invalid linearity metric: {args.linearity_metric}")
+                hook_handle.remove()
+            if args.linearity_metric == "lss":
+                lss = compute_line_shape_score(
+                    linearity_middle_states[1, :, :],
+                    logits_without_hook.reshape(-1, dim_middle_states)
+                    .detach()
+                    .to(torch.float32),
+                    args.alpha_factor,
+                )
+                mean_lss = float(np.mean(lss))
+                std_lss = float(np.std(lss))
+                logger.info(f"Mean LSS: {mean_lss}")
+                logger.info(f"Std LSS: {std_lss}")
+                os.makedirs(f"weights/linearity/lss", exist_ok=True)
+                torch.save(
+                    lss,
+                    f"weights/linearity/lss/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}.pt",
+                )
+            elif args.linearity_metric == "lsr":
+                seq_diff_norm_cpu = seq_diff_norm.cpu().numpy()
+                logger.info(f"Mean LSR: {float(np.mean(seq_diff_norm_cpu))}")
+                logger.info(f"Std LSR: {float(np.std(seq_diff_norm_cpu))}")
+                os.makedirs(f"weights/linearity/lsr", exist_ok=True)
+                torch.save(
+                    seq_diff_norm,
+                    f"weights/linearity/lsr/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}.pt",
+                )
+            elif args.linearity_metric == "simple_angle":
+                simple_angles_cpu = simple_angles.cpu().numpy()
+                logger.info(f"Mean Simple Angle: {float(np.mean(simple_angles_cpu))}")
+                logger.info(f"Std Simple Angle: {float(np.std(simple_angles_cpu))}")
+                os.makedirs(f"weights/linearity/simple_angle", exist_ok=True)
+                torch.save(
+                    simple_angles,
+                    f"weights/linearity/simple_angle/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}.pt",
+                )
+            else:
+                raise ValueError(f"Invalid linearity metric: {args.linearity_metric}")
 
 
 def compute_simple_angle_middle_states(
@@ -291,7 +319,9 @@ def compute_simple_angle_middle_states(
     logits_with_hook = logits_with_hook.to(torch.float32)
     if i == 0:
         last_logits_with_hook[1, :, :] = logits_with_hook
-        last_logits_with_hook[0, :, :] = last_logits_with_hook[1, :, :] - last_logits_with_hook[0, :, :]
+        last_logits_with_hook[0, :, :] = (
+            last_logits_with_hook[1, :, :] - last_logits_with_hook[0, :, :]
+        )
         return last_logits_with_hook, simple_angles
     else:
         diff_cur = logits_with_hook - last_logits_with_hook[1, :, :]
@@ -304,7 +334,7 @@ def compute_simple_angle_middle_states(
         norm_prev = torch.norm(diff_prev, p=2, dim=-1)
         cos_sim = dot_product / (norm_cur * norm_prev + 1e-8)
         cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
-        simple_angles[:, i -1] = cos_sim
+        simple_angles[:, i - 1] = cos_sim
         return last_logits_with_hook, simple_angles
 
 
