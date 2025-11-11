@@ -47,7 +47,7 @@ def config():
             "weights/concept_vectors/gemma-2-2b/random/random_layer26.pt",
         ],
     )
-    parser.add_argument("--concept_vector_alpha", type=float, default=1)
+    parser.add_argument("--concept_vector_alpha", type=float, default=1e-2)
     parser.add_argument("--random_concept_vector", action="store_true")
     parser.add_argument("--alpha_factor", type=int, default=1000)
     parser.add_argument("--max_dataset_nums", type=int, default=10)
@@ -58,9 +58,9 @@ def config():
         choices=["lss", "lsr", "simple_angle"],
     )
     parser.add_argument(
-        "--influence_layer", type=str, default="logits", choices=["logits", "all"]
+        "--influence_layer", type=str, default="all", choices=["logits", "all"]
     )
-    parser.add_argument("--steering_layer", type=int, default=3)
+    parser.add_argument("--steering_layer", type=int, default=8)
     parser.add_argument("--steering_layer_step", type=int, default=3)
     args = parser.parse_args()
     return args
@@ -105,8 +105,8 @@ def linearity():
     else:
         raise ValueError(f"Invalid dataset path: {args.dataset_path}")
     if args.influence_layer == "logits":
-        # influence_layers = range(model.config.num_hidden_layers)
-        influence_layers = [args.steering_layer]
+        influence_layers = range(model.config.num_hidden_layers)
+        # influence_layers = [args.steering_layer]
         linearity_layers = [-1]
     else:
         influence_layers = [args.steering_layer]
