@@ -18,7 +18,7 @@ def config():
     parser.add_argument(
         "--model",
         type=str,
-        default="google/gemma-2-2b-it",
+        default="EleutherAI/pythia-410m",
         choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m", "EleutherAI/pythia-410m", "EleutherAI/pythia-160m"],
     )
     parser.add_argument(
@@ -37,7 +37,7 @@ def config():
     parser.add_argument(
         "--concept_vector_path",
         type=str,
-        default="weights/concept_vectors/gemma-2-2b/difference-in-means/safety_layer26.pt",
+        default="weights/concept_vectors/pythia-410m/difference-in-means/safety_layer24.pt",
         choices=[
             "weights/concept_vectors/pythia-70m/difference-in-means/safety_layer6.pt",
             "weights/concept_vectors/pythia-70m/difference-in-means/language_en_fr_layer6.pt",
@@ -45,9 +45,11 @@ def config():
             "weights/concept_vectors/gemma-2-2b/difference-in-means/language_en_fr_layer26.pt",
             "weights/concept_vectors/gemma-2-2b/difference-in-means/safety_layer26.pt",
             "weights/concept_vectors/gemma-2-2b/random/random_layer26.pt",
+            "weights/concept_vectors/pythia-410m/difference-in-means/safety_layer24.pt",
+            "weights/concept_vectors/pythia-160m/difference-in-means/safety_layer12.pt",            
         ],
     )
-    parser.add_argument("--concept_vector_alpha", type=float, default=1e-2)
+    parser.add_argument("--concept_vector_alpha", type=float, default=1)
     parser.add_argument("--random_concept_vector", action="store_true")
     parser.add_argument("--alpha_factor", type=int, default=1000)
     parser.add_argument("--max_dataset_nums", type=int, default=10)
@@ -58,7 +60,7 @@ def config():
         choices=["lss", "lsr", "simple_angle"],
     )
     parser.add_argument(
-        "--influence_layer", type=str, default="all", choices=["logits", "all"]
+        "--influence_layer", type=str, default="logits", choices=["logits", "all"]
     )
     parser.add_argument("--steering_layer", type=int, default=3)
     parser.add_argument("--steering_layer_step", type=int, default=3)
@@ -282,7 +284,7 @@ def linearity():
                 os.makedirs(f"weights/linearity/lss", exist_ok=True)
                 torch.save(
                     lss,
-                    f"weights/linearity/lss/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}.pt",
+                    f"weights/linearity/lss/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}_Alpha{args.concept_vector_alpha}.pt",
                 )
             elif args.linearity_metric == "lsr":
                 seq_diff_norm_cpu = seq_diff_norm.cpu().numpy()
@@ -291,7 +293,7 @@ def linearity():
                 os.makedirs(f"weights/linearity/lsr", exist_ok=True)
                 torch.save(
                     seq_diff_norm,
-                    f"weights/linearity/lsr/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}.pt",
+                    f"weights/linearity/lsr/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}_Alpha{args.concept_vector_alpha}.pt",
                 )
             elif args.linearity_metric == "simple_angle":
                 simple_angles_cpu = simple_angles.cpu().numpy()
@@ -300,7 +302,7 @@ def linearity():
                 os.makedirs(f"weights/linearity/simple_angle", exist_ok=True)
                 torch.save(
                     simple_angles,
-                    f"weights/linearity/simple_angle/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}.pt",
+                    f"weights/linearity/simple_angle/{args.concept_vector_path.split('/')[-1].replace('.pt', '')}_Layer{layer_idx}_Layer{linearity_layer}_Alpha{args.concept_vector_alpha}.pt",
                 )
             else:
                 raise ValueError(f"Invalid linearity metric: {args.linearity_metric}")

@@ -15,6 +15,8 @@ MODEL_LAYERS = {
     "google/gemma-2-2b": 26,
     "Qwen/Qwen3-1.7B": 28,
     "EleutherAI/pythia-70m": 6,
+    "EleutherAI/pythia-410m": 24,
+    "EleutherAI/pythia-160m": 12,
 }
 
 
@@ -28,8 +30,8 @@ def config():
     parser.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen3-1.7B",
-        choices=["google/gemma-2-2b", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
+        default="EleutherAI/pythia-160m",
+        choices=["google/gemma-2-2b", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m", "EleutherAI/pythia-410m", "EleutherAI/pythia-160m"],
         help="the model to calculate the concept vector. TODO: add models with checkpoints and same model family",
     )
     parser.add_argument(
@@ -43,7 +45,7 @@ def config():
     parser.add_argument(
         "--concept_category",
         type=str,
-        default="language_en_fr",
+        default="safety",
         choices=["safety", "language_en_fr", "random"],
         help="the category of the concept",
     )
