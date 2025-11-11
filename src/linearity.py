@@ -19,7 +19,7 @@ def config():
         "--model",
         type=str,
         default="google/gemma-2-2b-it",
-        choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m"],
+        choices=["google/gemma-2-2b-it", "Qwen/Qwen3-1.7B", "EleutherAI/pythia-70m", "EleutherAI/pythia-410m", "EleutherAI/pythia-160m"],
     )
     parser.add_argument(
         "--dataset_path",
@@ -42,7 +42,7 @@ def config():
             "weights/concept_vectors/pythia-70m/difference-in-means/safety_layer6.pt",
             "weights/concept_vectors/pythia-70m/difference-in-means/language_en_fr_layer6.pt",
             "weights/concept_vectors/pythia-70m/random/random_layer6.pt",
-            "weights/concept_vectors/gemma-2-2b/difference-in-means/language_en_fr_layer26.pt"
+            "weights/concept_vectors/gemma-2-2b/difference-in-means/language_en_fr_layer26.pt",
             "weights/concept_vectors/gemma-2-2b/difference-in-means/safety_layer26.pt",
             "weights/concept_vectors/gemma-2-2b/random/random_layer26.pt",
         ],
@@ -60,7 +60,7 @@ def config():
     parser.add_argument(
         "--influence_layer", type=str, default="all", choices=["logits", "all"]
     )
-    parser.add_argument("--steering_layer", type=int, default=8)
+    parser.add_argument("--steering_layer", type=int, default=3)
     parser.add_argument("--steering_layer_step", type=int, default=3)
     args = parser.parse_args()
     return args
