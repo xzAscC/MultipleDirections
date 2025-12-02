@@ -4,6 +4,8 @@ import os
 import transformer_lens
 import datasets
 import gc
+import transformers
+import numpy as np
 from loguru import logger
 from tqdm import tqdm
 from utils import set_seed
@@ -21,11 +23,10 @@ MODEL_LAYERS = {
 }
 
 CONCEPT_CATEGORIES = {
-        "safety": ["assets/harmbench", "instruction"],
-        "language_en_fr": ["assets/language_translation", "text"],
-        "random": ["assets/random_contexts", None],
-    }
-
+    "safety": ["assets/harmbench", "instruction"],
+    "language_en_fr": ["assets/language_translation", "text"],
+    "random": ["assets/harmbench", "instruction"],
+}
 
 
 def config() -> argparse.Namespace:
@@ -73,13 +74,6 @@ def config() -> argparse.Namespace:
         help="the maximum size of the dataset to calculate the linearity",
     )
     parser.add_argument(
-        "--linearity_metric",
-        type=str,
-        default="lss",
-        choices=["lss", "lsr", "norm"],
-        help="the metric to use to calculate the linearity",
-    )
-    parser.add_argument(
         "--concept_vector_alpha",
         type=float,
         default=1,
@@ -90,6 +84,19 @@ def config() -> argparse.Namespace:
         type=int,
         default=1000,
         help="the factor to multiply the alpha by",
+    )
+    parser.add_argument(
+        "--remove_concept_vector",
+        action="store_true",
+        help="whether to remove the concept vector",
+    )
+    parser.add_argument(
+        "--linearity_metric",
+        type=str,
+        nargs="+",
+        default=["lss", "lsr"],
+        choices=["lss", "lsr", "norm"],
+        help="the metrics to use to calculate the linearity",
     )
     return parser.parse_args()
 
@@ -112,16 +119,33 @@ def linearity() -> None:
     dtype = getattr(torch, args.dtype)
     max_layers = MODEL_LAYERS[args.model]
     # load model
-    model = transformer_lens.HookedTransformer.from_pretrained(
-        args.model, device=args.device, dtype=dtype, trust_remote_code=True
-    )
+    logger.info(f"args.linearity_metric: {args.linearity_metric}")
 
     for concept_category_name, concept_category_metadata in CONCEPT_CATEGORIES.items():
         save_path = f"assets/linearity/{model_name}/{concept_category_name}.pt"
         if args.concept_vector_pretrained:
-            concept_vector = torch.load(save_path)
+            concept_vectors = torch.load(save_path)
+            if concept_category_name == "language_en_fr":
+                dataset_path = os.path.join(concept_category_metadata[0], "en.jsonl")
+                dataset = datasets.load_dataset(
+                    "json", data_files=dataset_path, split="train"
+                )
+                dataset_key = "text"
+            else:
+                dataset_path = os.path.join(
+                    concept_category_metadata[0], "harmful_data.jsonl"
+                )
+                dataset = datasets.load_dataset(
+                    "json", data_files=dataset_path, split="train"
+                )
+                dataset_key = "instruction"
+            dataset = dataset.shuffle().select(range(args.linearity_dataset_size))
+            input_prompts = dataset[: args.linearity_dataset_size][dataset_key]
         else:
-            concept_vector = obtain_concept_vector(
+            model = transformer_lens.HookedTransformer.from_pretrained(
+                args.model, device=args.device, dtype=dtype, trust_remote_code=True
+            )
+            concept_vector, dataset, dataset_key = obtain_concept_vector(
                 concept_category_name,
                 concept_category_metadata,
                 model,
@@ -131,7 +155,327 @@ def linearity() -> None:
                 max_dataset_size=args.concept_vector_dataset_size,
                 save_path=save_path,
             )
-        
+            del model
+            torch.cuda.empty_cache()
+            gc.collect()
+        logger.info(f"Concept vectors shape: {concept_vectors.shape}")
+        for metric in args.linearity_metric:
+            logger.info(f"Measuring {metric} for {concept_category_name}")
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                args.model,
+                device_map=args.device,
+                dtype=dtype,
+                trust_remote_code=True,
+            )
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                args.model,
+                use_fast=True,
+                dtype=dtype,
+            )
+
+            def _get_layers_container(hf_model):
+                """used to get the layers container of the model
+                Args:
+                    hf_model (transformers.PreTrainedModel): the model to get the layers container
+                Returns:
+                    layers (list): the layers container of the model
+                """
+                # Common containers across HF architectures
+                candidates = [
+                    (hf_model, "gpt_neox", "layers"),
+                    (hf_model, "model", "layers"),
+                    (hf_model, "transformer", "layers"),
+                    (hf_model, "transformer", "h"),
+                ]
+                for root_obj, root_attr, layers_attr in candidates:
+                    root = getattr(root_obj, root_attr, None)
+                    if root is None:
+                        continue
+                    layers = getattr(root, layers_attr, None)
+                    if layers is not None:
+                        return layers
+                raise AttributeError(
+                    "Unable to locate transformer layers container on model"
+                )
+
+            for layer_idx in tqdm(range(max_layers), desc="Measuring linearity"):
+                concept_vector = concept_vectors[layer_idx, :]
+                logger.info(f"Concept vector: {concept_vector.shape}")
+                # Set padding token if not already set
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                layers_container = _get_layers_container(model)
+                target_layer_module = layers_container[layer_idx]
+                input_ids = tokenizer(
+                    input_prompts, return_tensors="pt", truncation=True, padding=True
+                ).to(args.device)
+                input_ids = input_ids.input_ids
+                output = model(input_ids, output_hidden_states=True)
+                last_layer_hidden_states = output.hidden_states[-1]
+                dim_middle_states = last_layer_hidden_states.shape[-1]
+                seq_len = last_layer_hidden_states.shape[1]
+                if metric == "lss":
+                    lss_middle_states = torch.zeros(
+                        2,
+                        seq_len * args.linearity_dataset_size,
+                        dim_middle_states,
+                        device=torch.device(args.device),
+                        dtype=torch.float32,
+                    )  # [0, :] is the base state, [1, :] is the modified state
+                elif metric == "lsr":
+                    last_logits_with_hook = (
+                        last_layer_hidden_states.reshape(-1, dim_middle_states)
+                        .detach()
+                        .to(torch.float32)
+                    )
+                    seq_diff_norm = torch.zeros(
+                        seq_len * args.linearity_dataset_size,
+                        device=torch.device(args.device),
+                        dtype=torch.float32,
+                    )
+                elif metric == "norm":
+                    mean_norm = torch.zeros(
+                        args.alpha_factor,
+                        device=torch.device(args.device),
+                        dtype=torch.float32,
+                    )
+                    std_norm = torch.zeros(
+                        args.alpha_factor,
+                        device=torch.device(args.device),
+                        dtype=torch.float32,
+                    )
+                else:
+                    raise ValueError(f"Invalid metric: {metric}")
+
+                for i in tqdm(range(args.alpha_factor), desc="Measuring linearity"):
+                    concept_vector_alpha = args.concept_vector_alpha * (i + 1)
+
+                    def _forward_hook(module, inputs, output):
+                        # Ensure concept vector matches device/dtype
+                        if isinstance(output, tuple):
+                            hidden = output[0]
+                            vec = concept_vector.to(
+                                device=hidden.device, dtype=hidden.dtype
+                            )
+                            hidden = hidden + concept_vector_alpha * vec
+                            return (hidden,) + output[1:]
+                        else:
+                            vec = concept_vector.to(
+                                device=output.device, dtype=output.dtype
+                            )
+                            return output - concept_vector_alpha * vec
+
+                    hook_handle = target_layer_module.register_forward_hook(
+                        _forward_hook
+                    )
+                    output = model(input_ids, output_hidden_states=True)
+                    steered_last_layer_hidden_states = output.hidden_states[-1]
+                    hook_handle.remove()
+                    if metric == "lss":
+                        lss_middle_states = compute_line_shape_score_middle_states(
+                            steered_last_layer_hidden_states.reshape(
+                                -1, dim_middle_states
+                            )
+                            .detach()
+                            .to(torch.float32),
+                            last_layer_hidden_states.reshape(-1, dim_middle_states)
+                            .detach()
+                            .to(torch.float32),
+                            lss_middle_states,
+                            i,
+                            args.concept_vector_alpha,
+                            concept_vector,
+                            remove_concept_vector=args.remove_concept_vector,
+                        )
+                    elif metric == "lsr":
+                        last_logits_with_hook, seq_diff_norm = (
+                            compute_lsr_middle_states(
+                                steered_last_layer_hidden_states.reshape(
+                                    -1, dim_middle_states
+                                )
+                                .detach()
+                                .to(torch.float32),
+                                last_logits_with_hook,
+                                last_layer_hidden_states.reshape(-1, dim_middle_states)
+                                .detach()
+                                .to(torch.float32),
+                                seq_diff_norm,
+                                i,
+                                args.alpha_factor,
+                                args.concept_vector_alpha,
+                                concept_vector,
+                                remove_concept_vector=args.remove_concept_vector,
+                            )
+                        )
+                    elif metric == "norm":
+                        norm_diff = torch.norm(steered_last_layer_hidden_states.reshape(-1, dim_middle_states) - last_layer_hidden_states.reshape(-1, dim_middle_states), p=2, dim=-1) / torch.norm(last_layer_hidden_states.reshape(-1, dim_middle_states), p=2, dim=-1)
+                        norm_diff = norm_diff.cpu().numpy()
+                        mean_norm[i] = float(np.mean(norm_diff))
+                        std_norm[i] = float(np.std(norm_diff))
+
+                    else:
+                        raise ValueError(f"Invalid metric: {metric}")
+                if metric == "lss":
+                    lss = compute_line_shape_score(
+                        lss_middle_states[1, :, :],
+                        last_layer_hidden_states.reshape(-1, dim_middle_states)
+                        .detach()
+                        .to(torch.float32),
+                        args.alpha_factor,
+                    )
+                    mean_lss = float(np.mean(lss))
+                    std_lss = float(np.std(lss))
+                    logger.info(f"Mean LSS: {mean_lss}")
+                    logger.info(f"Std LSS: {std_lss}")
+                    os.makedirs(f"weights/linearity/lss", exist_ok=True)
+                    torch.save(
+                        lss,
+                        f"assets/linearity/{model_name}/lss_{concept_category_name}_layer{layer_idx}.pt",
+                    )
+                elif metric == "lsr":
+                    seq_diff_norm_cpu = seq_diff_norm.cpu().numpy()
+                    mean_lsr = float(np.mean(seq_diff_norm_cpu))
+                    std_lsr = float(np.std(seq_diff_norm_cpu))
+                    logger.info(f"Mean LSR: {mean_lsr}")
+                    logger.info(f"Std LSR: {std_lsr}")
+                    torch.save(
+                        seq_diff_norm,
+                        f"assets/linearity/{model_name}/lsr_{concept_category_name}_layer{layer_idx}.pt",
+                    )
+                elif metric == "norm":
+                    mean_norm_cpu = mean_norm.cpu().numpy()
+                    std_norm_cpu = std_norm.cpu().numpy()
+                    logger.info(f"Mean Norm: {mean_norm_cpu}")
+                    logger.info(f"Std Norm: {std_norm_cpu}")
+                    torch.save(
+                        mean_norm,
+                        f"assets/linearity/{model_name}/norm_{concept_category_name}_layer{layer_idx}.pt",
+                    )
+                    torch.save(
+                        std_norm,
+                        f"assets/linearity/{model_name}/norm_{concept_category_name}_layer{layer_idx}.pt",
+                    )
+                else:
+                    raise ValueError(f"Invalid metric: {metric}")
+
+
+def compute_line_shape_score(
+    lss_final_states: torch.Tensor, initial_state: torch.Tensor, iteration_times: int
+):
+    """
+    Compute Line-Shape Score.
+
+    Args:
+        lss_final_states: The final states.
+        initial_state: The initial state.
+        iteration_times: The iteration times.
+
+    Returns:
+        The Line-Shape Score.
+    """
+    diff = lss_final_states - initial_state
+    diff_norm = diff.norm(p=2, dim=-1)
+    diff_norm = torch.clamp(diff_norm, min=1e-8)
+    return (iteration_times / diff_norm).detach().to(torch.float32).tolist()
+
+
+def compute_lsr_middle_states(
+    logits_with_hook: torch.Tensor,
+    last_logits_with_hook: torch.Tensor,
+    logits_without_hook: torch.Tensor,
+    seq_diff_norm: torch.Tensor,
+    i: int,
+    alpha_factor: int,
+    concept_vector_alpha: float,
+    concept_vector: torch.Tensor,
+    remove_concept_vector: bool = False,
+):
+    """
+    Compute LSR (per token, streaming over layers, no full storage).
+    Args:
+        logits_with_hook: The logits with hook.
+        last_logits_with_hook: The last logits with hook.
+        logits_without_hook: The logits without hook.
+        seq_diff_norm: The sequence difference norm.
+        i: The index of the alpha.
+        alpha_factor: The alpha factor.
+        concept_vector_alpha: The alpha of the concept vector.
+        concept_vector: The concept vector.
+        remove_concept_vector: Whether to remove the concept vector.
+    Returns:
+        logits_with_hook: The logits with hook.
+        seq_diff_norm: The sequence difference norm.
+    """
+    if remove_concept_vector:
+        updated_concept_vector = concept_vector_alpha * concept_vector.to(
+            device=logits_with_hook.device, dtype=logits_with_hook.dtype
+        )
+    else:
+        updated_concept_vector = 0
+    if i == alpha_factor - 1:
+        diff = logits_with_hook - last_logits_with_hook - updated_concept_vector
+        diff_norm = torch.norm(diff, p=2, dim=-1)
+        diff_norm = torch.clamp(diff_norm, min=1e-8)
+        seq_diff_norm += diff_norm
+        overall_diff_norm = (
+            logits_with_hook - logits_without_hook - updated_concept_vector
+        )
+        overall_diff_norm = torch.norm(overall_diff_norm, p=2, dim=-1)
+        overall_diff_norm = torch.clamp(overall_diff_norm, min=1e-8)
+        return logits_with_hook, seq_diff_norm / overall_diff_norm
+    else:
+        diff = logits_with_hook - last_logits_with_hook - updated_concept_vector
+        diff_norm = torch.norm(diff, p=2, dim=-1)
+        diff_norm = torch.clamp(diff_norm, min=1e-8)
+        seq_diff_norm += diff_norm
+        return logits_with_hook, seq_diff_norm
+
+
+def compute_line_shape_score_middle_states(
+    logits_with_hook: torch.Tensor,
+    logits_without_hook: torch.Tensor,
+    lss_middle_states: torch.Tensor,
+    i: int,
+    concept_vector_alpha: float,
+    concept_vector: torch.Tensor,
+    remove_concept_vector: bool = False,
+):
+    """
+    Compute Line-Shape Score (per token, streaming over layers, no full storage).
+
+    Args:
+        logits_with_hook: The logits with hook.
+        logits_without_hook: The logits without hook.
+        lss_middle_states: The middle states.
+        i: The index of the alpha.
+        concept_vector_alpha: The alpha of the concept vector.
+        concept_vector: The concept vector.
+        remove_concept_vector: Whether to remove the concept vector.
+    Returns:
+        lss_middle_states: The middle states.
+    """
+    if remove_concept_vector:
+        updated_concept_vector = concept_vector_alpha * concept_vector
+    else:
+        updated_concept_vector = 0
+    if i == 0:
+        lss_middle_states[0, :, :] = logits_without_hook
+        diff = logits_with_hook - logits_without_hook - updated_concept_vector
+        diff_norm = torch.norm(diff, p=2, dim=-1, keepdim=True)
+        diff_norm = torch.clamp(diff_norm, min=1e-8)
+        normalized_diff = diff / diff_norm
+        lss_middle_states[1, :, :] = (
+            normalized_diff + lss_middle_states[0, :, :] - updated_concept_vector
+        )
+        lss_middle_states[0, :, :] = logits_without_hook
+    else:
+        diff = logits_with_hook - lss_middle_states[0, :, :] - updated_concept_vector
+        diff_norm = torch.norm(diff, p=2, dim=-1, keepdim=True)
+        diff_norm = torch.clamp(diff_norm, min=1e-8)
+        normalized_diff = diff / diff_norm
+        lss_middle_states[1, :, :] = normalized_diff + lss_middle_states[1, :, :]
+        lss_middle_states[0, :, :] = logits_with_hook
+    return lss_middle_states
 
 
 def obtain_concept_vector(
@@ -145,7 +489,6 @@ def obtain_concept_vector(
     save_path: str,
     methods: str = "difference-in-means",
 ) -> torch.Tensor:
-    
     """used to obtain the concept vector for the given concept category
 
     Args:
@@ -160,6 +503,8 @@ def obtain_concept_vector(
         methods (str): the method to use to obtain the concept vector, default is "difference-in-means"
     Returns:
         torch.Tensor: the concept vector
+        datasets.Dataset: the positive dataset
+        str: the key of the dataset
     """
     dataset_path = concept_category_metadata[0]
     dataset_key = concept_category_metadata[1]
@@ -182,6 +527,10 @@ def obtain_concept_vector(
             "json", data_files=negative_dataset_path, split="train"
         )
     elif concept_category_name == "random":
+        positive_dataset_path = os.path.join(dataset_path, "harmful_data.jsonl")
+        positive_dataset = datasets.load_dataset(
+            "json", data_files=positive_dataset_path, split="train"
+        )
         hidden_state_dim = model.cfg.d_model
         concept_vector = torch.randn(max_layers, hidden_state_dim, device=device)
         concept_vector = torch.nn.functional.normalize(concept_vector, dim=1)
@@ -190,10 +539,10 @@ def obtain_concept_vector(
         logger.info(f"Concept vector: {concept_vector.norm(dim=1)}")
         torch.cuda.empty_cache()
         gc.collect()
-        return concept_vector
+        return concept_vector, positive_dataset, dataset_key
     else:
         raise ValueError(f"Invalid concept category: {concept_category_name}")
-    
+
     concept_vector = get_concept_vectors(
         model=model,
         positive_dataset=positive_dataset,
@@ -208,8 +557,8 @@ def obtain_concept_vector(
     )
     torch.cuda.empty_cache()
     gc.collect()
-    
-    return concept_vector
+
+    return concept_vector, positive_dataset, dataset_key
 
 
 def get_concept_vectors(
@@ -296,7 +645,9 @@ class DifferenceInMeans:
         self.max_dataset_size = max_dataset_size
         self.dtype = dtype
 
-    def get_concept_vectors(self, save_path: str, is_save: bool = False)-> torch.Tensor:
+    def get_concept_vectors(
+        self, save_path: str, is_save: bool = False
+    ) -> torch.Tensor:
         """used to calculate the concept vectors using difference-in-means
 
         Args:
@@ -308,6 +659,7 @@ class DifferenceInMeans:
         """
         model_dimension = self.model.cfg.d_model
         layer_length = len(self.layers)
+        logger.info(f"layer_length: {layer_length}")
         positive_concept_vector = torch.zeros(
             layer_length, model_dimension, device=self.device, dtype=self.dtype
         )
@@ -316,16 +668,20 @@ class DifferenceInMeans:
         )
         positive_token_length = 0
         negative_token_length = 0
-        positive_dataset_size = len(self.positive_dataset) if self.max_dataset_size > len(self.positive_dataset) else self.max_dataset_size
-        for i, example in tqdm(enumerate(self.positive_dataset), total=positive_dataset_size):
+        positive_dataset_size = (
+            len(self.positive_dataset)
+            if self.max_dataset_size > len(self.positive_dataset)
+            else self.max_dataset_size
+        )
+        for i, example in tqdm(
+            enumerate(self.positive_dataset), total=positive_dataset_size
+        ):
             if i >= self.max_dataset_size:
                 break
             torch.cuda.empty_cache()
             gc.collect()
             context = example[self.positive_dataset_key]
-            _, positive_cache = self.model.run_with_cache(
-                context
-            )
+            _, positive_cache = self.model.run_with_cache(context)
             for layer in self.layers:
                 positive_hidden_state = positive_cache[
                     f"blocks.{layer}.hook_resid_post"
@@ -334,14 +690,22 @@ class DifferenceInMeans:
                 if layer == 0:
                     current_token_length = positive_hidden_state.shape[0]
                     positive_token_length += current_token_length
-        negative_dataset_size = len(self.negative_dataset) if self.max_dataset_size > len(self.negative_dataset) else self.max_dataset_size
-        for i, example in tqdm(enumerate(self.negative_dataset), total=negative_dataset_size):
+        negative_dataset_size = (
+            len(self.negative_dataset)
+            if self.max_dataset_size > len(self.negative_dataset)
+            else self.max_dataset_size
+        )
+        for i, example in tqdm(
+            enumerate(self.negative_dataset), total=negative_dataset_size
+        ):
             if i >= self.max_dataset_size:
                 break
             torch.cuda.empty_cache()
             gc.collect()
             context = example[self.negative_dataset_key]
-            _, negative_cache = self.model.run_with_cache(context, stop_at_layer=layer+1)
+            _, negative_cache = self.model.run_with_cache(
+                context, stop_at_layer=layer + 1
+            )
             for layer in self.layers:
                 negative_hidden_state = negative_cache[
                     f"blocks.{layer}.hook_resid_post"
@@ -360,6 +724,7 @@ class DifferenceInMeans:
         logger.info(f"Concept vector shape: {concept_diff.shape}")
         logger.info(f"Concept vector: {concept_diff.norm(dim=1)}")
         return concept_diff
+
 
 if __name__ == "__main__":
     linearity()

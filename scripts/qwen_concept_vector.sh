@@ -2,9 +2,9 @@
 
 # define the models
 models=(
-#   "EleutherAI/pythia-70m"
-  "EleutherAI/pythia-160m"
-  "EleutherAI/pythia-410m"
+    "Qwen/Qwen3-1.7B"
+    "Qwen/Qwen3-8b"
+    "Qwen/Qwen3-14B"
 )
 
 # define the layer and method
@@ -20,6 +20,6 @@ for model_name in "${models[@]}"; do
       --alpha_factor 1000 \
       --linearity_dataset_size 30 \
       --seed 42 \
-      --concept_vector_pretrained
+    #   --concept_vector_pretrained
     #   --remove_concept_vector
 done
