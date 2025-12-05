@@ -8,11 +8,13 @@ import transformers
 import numpy as np
 from loguru import logger
 from tqdm import tqdm
-from utils import set_seed
+from utils import set_seed, seed_from_name
+
+# TODO: how to handle the last layer?
 
 MODEL_LAYERS = {
     "google/gemma-3-270m-it": 18,
-    "google/gemma-3-4b-it": 34,  # TODO: this is a multimodal model
+    "google/gemma-3-4b-it": 34,  # TODO: replace with Gemma2, and add Mistral3
     "google/gemma-3-12b-it": 48,
     "Qwen/Qwen3-1.7B": 28,
     "Qwen/Qwen3-8b": 36,
@@ -26,6 +28,9 @@ CONCEPT_CATEGORIES = {
     "safety": ["assets/harmbench", "instruction"],
     "language_en_fr": ["assets/language_translation", "text"],
     "random": ["assets/harmbench", "instruction"],
+    "random1": ["assets/harmbench", "instruction"],
+    "random2": ["assets/language_translation", "text"],
+    "random3": ["assets/language_translation", "text"],
 }
 
 
@@ -37,7 +42,7 @@ def config() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="EleutherAI/pythia-70m",
+        default="Qwen/Qwen3-1.7B",
         choices=MODEL_LAYERS.keys(),
         help="the model to calculate the linearity",
     )
@@ -125,27 +130,27 @@ def linearity() -> None:
         save_path = f"assets/linearity/{model_name}/{concept_category_name}.pt"
         if args.concept_vector_pretrained:
             concept_vectors = torch.load(save_path)
-            if concept_category_name == "language_en_fr":
+            if concept_category_name in ["language_en_fr", "random2", "random3"]:
                 dataset_path = os.path.join(concept_category_metadata[0], "en.jsonl")
                 dataset = datasets.load_dataset(
                     "json", data_files=dataset_path, split="train"
                 )
-                dataset_key = "text"
-            else:
+                dataset_key = concept_category_metadata[1]
+            elif concept_category_name in ["random1", "safety", "random"]:
                 dataset_path = os.path.join(
                     concept_category_metadata[0], "harmful_data.jsonl"
                 )
                 dataset = datasets.load_dataset(
                     "json", data_files=dataset_path, split="train"
                 )
-                dataset_key = "instruction"
-            dataset = dataset.shuffle().select(range(args.linearity_dataset_size))
-            input_prompts = dataset[: args.linearity_dataset_size][dataset_key]
+                dataset_key = concept_category_metadata[1]
+            else:
+                raise ValueError(f"Invalid concept category name: {concept_category_name}")
         else:
             model = transformer_lens.HookedTransformer.from_pretrained(
                 args.model, device=args.device, dtype=dtype, trust_remote_code=True
             )
-            concept_vector, dataset, dataset_key = obtain_concept_vector(
+            concept_vectors, dataset, dataset_key = obtain_concept_vector(
                 concept_category_name,
                 concept_category_metadata,
                 model,
@@ -158,6 +163,8 @@ def linearity() -> None:
             del model
             torch.cuda.empty_cache()
             gc.collect()
+        dataset = dataset.shuffle().select(range(args.linearity_dataset_size))
+        input_prompts = dataset[: args.linearity_dataset_size][dataset_key]
         logger.info(f"Concept vectors shape: {concept_vectors.shape}")
         for metric in args.linearity_metric:
             logger.info(f"Measuring {metric} for {concept_category_name}")
@@ -263,7 +270,7 @@ def linearity() -> None:
                             vec = concept_vector.to(
                                 device=output.device, dtype=output.dtype
                             )
-                            return output - concept_vector_alpha * vec
+                            return output + concept_vector_alpha * vec
 
                     hook_handle = target_layer_module.register_forward_hook(
                         _forward_hook
@@ -309,10 +316,9 @@ def linearity() -> None:
                         )
                     elif metric == "norm":
                         norm_diff = torch.norm(steered_last_layer_hidden_states.reshape(-1, dim_middle_states) - last_layer_hidden_states.reshape(-1, dim_middle_states), p=2, dim=-1) / torch.norm(last_layer_hidden_states.reshape(-1, dim_middle_states), p=2, dim=-1)
-                        norm_diff = norm_diff.cpu().numpy()
+                        norm_diff = norm_diff.detach().cpu().numpy()
                         mean_norm[i] = float(np.mean(norm_diff))
                         std_norm[i] = float(np.std(norm_diff))
-
                     else:
                         raise ValueError(f"Invalid metric: {metric}")
                 if metric == "lss":
@@ -328,33 +334,51 @@ def linearity() -> None:
                     logger.info(f"Mean LSS: {mean_lss}")
                     logger.info(f"Std LSS: {std_lss}")
                     os.makedirs(f"weights/linearity/lss", exist_ok=True)
-                    torch.save(
-                        lss,
-                        f"assets/linearity/{model_name}/lss_{concept_category_name}_layer{layer_idx}.pt",
-                    )
+                    if args.remove_concept_vector:
+                        torch.save(
+                            lss,
+                            f"assets/linearity/{model_name}/lss_{concept_category_name}_layer{layer_idx}_w_remove.pt",
+                        )
+                    else:
+                        torch.save(
+                            lss,
+                            f"assets/linearity/{model_name}/lss_{concept_category_name}_layer{layer_idx}_wo_remove.pt",
+                        )
                 elif metric == "lsr":
                     seq_diff_norm_cpu = seq_diff_norm.cpu().numpy()
                     mean_lsr = float(np.mean(seq_diff_norm_cpu))
                     std_lsr = float(np.std(seq_diff_norm_cpu))
                     logger.info(f"Mean LSR: {mean_lsr}")
                     logger.info(f"Std LSR: {std_lsr}")
-                    torch.save(
-                        seq_diff_norm,
-                        f"assets/linearity/{model_name}/lsr_{concept_category_name}_layer{layer_idx}.pt",
-                    )
+                    if args.remove_concept_vector:
+                        torch.save(
+                            seq_diff_norm,
+                            f"assets/linearity/{model_name}/lsr_{concept_category_name}_layer{layer_idx}_w_remove.pt",
+                        )
+                    else:
+                        torch.save(
+                            seq_diff_norm,
+                            f"assets/linearity/{model_name}/lsr_{concept_category_name}_layer{layer_idx}_wo_remove.pt",
+                        )
                 elif metric == "norm":
-                    mean_norm_cpu = mean_norm.cpu().numpy()
-                    std_norm_cpu = std_norm.cpu().numpy()
-                    logger.info(f"Mean Norm: {mean_norm_cpu}")
-                    logger.info(f"Std Norm: {std_norm_cpu}")
-                    torch.save(
-                        mean_norm,
-                        f"assets/linearity/{model_name}/norm_{concept_category_name}_layer{layer_idx}.pt",
-                    )
-                    torch.save(
-                        std_norm,
-                        f"assets/linearity/{model_name}/norm_{concept_category_name}_layer{layer_idx}.pt",
-                    )
+                    if args.remove_concept_vector:
+                        torch.save(
+                            mean_norm,
+                            f"assets/linearity/{model_name}/mean_norm_{concept_category_name}_layer{layer_idx}_w_remove.pt",
+                        )
+                        torch.save(
+                            std_norm,
+                            f"assets/linearity/{model_name}/std_norm_{concept_category_name}_layer{layer_idx}_w_remove.pt",
+                        )
+                    else:
+                        torch.save(
+                            mean_norm,
+                            f"assets/linearity/{model_name}/mean_norm_{concept_category_name}_layer{layer_idx}_wo_remove.pt",
+                        )
+                        torch.save(
+                            std_norm,
+                            f"assets/linearity/{model_name}/std_norm_{concept_category_name}_layer{layer_idx}_wo_remove.pt",
+                        )
                 else:
                     raise ValueError(f"Invalid metric: {metric}")
 
@@ -526,11 +550,19 @@ def obtain_concept_vector(
         negative_dataset = datasets.load_dataset(
             "json", data_files=negative_dataset_path, split="train"
         )
-    elif concept_category_name == "random":
-        positive_dataset_path = os.path.join(dataset_path, "harmful_data.jsonl")
-        positive_dataset = datasets.load_dataset(
-            "json", data_files=positive_dataset_path, split="train"
-        )
+    elif concept_category_name in ["random", "random1", "random2", "random3"]:
+        seed = seed_from_name(concept_category_name)
+        set_seed(seed)
+        if concept_category_name in ["random", "random1"]:
+            positive_dataset_path = os.path.join(dataset_path, "harmful_data.jsonl")
+            positive_dataset = datasets.load_dataset(
+                "json", data_files=positive_dataset_path, split="train"
+            )
+        elif concept_category_name in ["random2", "random3"]:
+            positive_dataset_path = os.path.join(dataset_path, "en.jsonl")
+            positive_dataset = datasets.load_dataset(
+                "json", data_files=positive_dataset_path, split="train"
+            )
         hidden_state_dim = model.cfg.d_model
         concept_vector = torch.randn(max_layers, hidden_state_dim, device=device)
         concept_vector = torch.nn.functional.normalize(concept_vector, dim=1)
@@ -572,7 +604,7 @@ def get_concept_vectors(
     methods: str,
     save_path: str,
     max_dataset_size: int = 300,
-) -> None:
+) -> torch.Tensor:
     """used to get the concept vectors using the specified method
 
     Args:
@@ -588,7 +620,7 @@ def get_concept_vectors(
         max_dataset_size (int, optional): the maximum size of the dataset to get the concept vectors. Defaults to 300.
 
     Returns:
-        None
+        torch.Tensor: the concept vectors
     """
     # TODO: more methods
     if methods == "difference-in-means":
@@ -602,12 +634,13 @@ def get_concept_vectors(
             negative_dataset_key=negative_dataset_key,
             max_dataset_size=max_dataset_size,
         )
-        difference_in_means.get_concept_vectors(
+        concept_vector = difference_in_means.get_concept_vectors(
             save_path=save_path,
             is_save=True,
         )
     else:
         raise ValueError(f"Invalid method: {methods}")
+    return concept_vector
 
 
 class DifferenceInMeans:
